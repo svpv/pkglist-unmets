@@ -122,12 +122,72 @@ static_assert(sizeof(struct reqTokenV) == 4, "reqTokenV");
 
 #include <rpm/rpmlib.h>
 
-void addHeader(Header h)
+// Add the package to pkgNameTab.
+int addPkg(Header h)
 {
+    int pkgIx = pkgIxPos;
+    pkgIxTab[pkgIxPos++] = pkgNamePos;
+
+    const char *name = headerGetString(h, RPMTAG_NAME);
+    assert(name);
+    size_t len = strlen(name);
+    assert(pkgNamePos + len + 1 < sizeof pkgNameTab);
+    memcpy(pkgNameTab + pkgNamePos, name, len);
+    pkgNamePos += len;
+    pkgNameTab[pkgNamePos++] = ' ';
+
+    char *EVR = headerGetAsString(h, RPMTAG_EVR);
+    assert(EVR);
+    len = strlen(EVR);
+    assert(pkgNamePos + len + 1 < sizeof pkgNameTab);
+    memcpy(pkgNameTab + pkgNamePos, EVR, len + 1);
+    pkgNamePos += len + 1;
+    free(EVR);
+
+    return pkgIx;
 }
 
-int main()
+int verbose;
+
+void addHeader(Header h)
 {
+    int pkgIx = addPkg(h);
+    if (verbose > 1)
+	fprintf(stderr, "loaded %s\n", pkgNameTab + pkgIxTab[pkgIx]);
+}
+
+#include <stdbool.h>
+#include <getopt.h>
+
+const struct option longopts[] = {
+    { "help", no_argument, NULL, 'h' },
+    { "verbose", no_argument, NULL, 'v' },
+    { NULL },
+};
+
+int main(int argc, char **argv)
+{
+    const char *argv0 = argv[0];
+    bool usage = false;
+    int c;
+    while ((c = getopt_long(argc, argv, "v", longopts, NULL)) != -1) {
+	switch (c) {
+	case 'v':
+	    verbose++;
+	    break;
+	default:
+	    usage = true;
+	}
+    }
+    argc -= optind, argv += optind;
+    if (argc && !usage) {
+	fprintf(stderr, "%s: too many arguments\n", argv0);
+	usage = 1;
+    }
+    if (usage) {
+	fprintf(stderr, "Usage: cat /var/lib/apt/lists/*pkglist.* | %s\n", argv0);
+	return 1;
+    }
     FD_t Fd = fdDup(0);
     Header h;
     while ((h = headerRead(Fd, HEADER_MAGIC_YES))) {
@@ -135,6 +195,9 @@ int main()
 	headerFree(h);
     }
     Fclose(Fd);
+    if (verbose)
+	fprintf(stderr, "loaded %d headers (%dM out of %zuM pkgTab)\n", pkgIxPos,
+			1 + (pkgNamePos >> 20), sizeof pkgNameTab >> 20);
     return 0;
 }
 
