@@ -155,11 +155,88 @@ void sortDeps(int n, const char **names, const char **versions, int *flags)
     QSORT(n, DEP_LESS, DEP_SWAP);
 }
 
+#include "lcp.h"
+
+char frame[8<<20];
+
+void addReq(Header h, int pkgIx)
+{
+    struct rpmtd_s td1, td2, td3;
+    int rc = headerGet(h, RPMTAG_REQUIRENAME, &td1, HEADERGET_MINMEM);
+    // Assume that Requires must be present - someplace, they check
+    // for the "rpmlib(PayloadIsLzma)" dependency as mandatory.
+    assert(rc == 1);
+    assert(td1.count > 0);
+    int n = td1.count;
+    assert(td1.type == RPM_STRING_ARRAY_TYPE);
+    const char **names = td1.data;
+
+    rc = headerGet(h, RPMTAG_REQUIREVERSION, &td2, HEADERGET_MINMEM);
+    assert(rc == 1);
+    assert(td2.count == n);
+    assert(td2.type == RPM_STRING_ARRAY_TYPE);
+    const char **versions = td2.data;
+
+    rc = headerGet(h, RPMTAG_REQUIREFLAGS, &td3, HEADERGET_MINMEM);
+    assert(rc == 1);
+    assert(td3.count == n);
+    assert(td3.type == RPM_INT32_TYPE);
+    int *flags = td3.data;
+
+    sortDeps(n, names, versions, flags);
+
+    char *p = frame, *end = p + sizeof frame;
+    size_t lastNameLen = 0, lastLcpLen = 0;
+    for (int i = 0; i < n; i++) {
+	// Make a token.
+	unsigned sense = (flags[i] & RPMSENSE_SENSEMASK) >> 1;
+	assert(sense < 8);
+	size_t nameLen = strlen(names[i]);
+	assert(nameLen < 4096);
+	size_t lcpLen = i ? lcp(names[i-1], lastNameLen, names[i], nameLen) : 0;
+	int delta = (int) lcpLen - (int) lastLcpLen;
+	size_t len1 = nameLen - lcpLen;
+	struct reqToken token = {
+	    .sense = sense,
+	    .delta = delta,
+	    .len = len1,
+	    .pkg = pkgIx,
+	};
+	// Name not changed?
+	if (delta == 0 && len1 == 0)
+	    // No version? It must be a dup then, as per depCmp ordering.
+	    // E.g. "Requires: /bin/sh" and "Requires(pre): /bin/sh".
+	    if (sense == 0)
+		continue;
+	// Put the record.
+	assert(p + 6 + (sense ? 4 : 0) + len1 < end);
+	memcpy(p, &token, 6);
+	p += 6;
+	if (sense) {
+	    // Put version.
+	    size_t vlen = strlen(versions[i]);
+	    assert(depVerPos + vlen + 1 < sizeof depVerTab);
+	    memcpy(depVerTab + depVerPos, versions[i], vlen + 1);
+	    memcpy(p, &depVerPos, 4);
+	    depVerPos += vlen + 1;
+	    p += 4;
+	}
+	memcpy(p, names[i] + lcpLen, len1);
+	p += len1;
+	lastNameLen = nameLen, lastLcpLen = lcpLen;
+    }
+
+    rpmtdFreeData(&td1);
+    rpmtdFreeData(&td2);
+    rpmtdFreeData(&td3);
+}
+
 int verbose;
 
 void addHeader(Header h)
 {
     int pkgIx = addPkg(h);
+    addReq(h, pkgIx);
     if (verbose > 1)
 	fprintf(stderr, "loaded %s\n", pkgNameTab + pkgIxTab[pkgIx]);
 }
