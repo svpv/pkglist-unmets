@@ -147,6 +147,38 @@ int addPkg(Header h)
     return pkgIx;
 }
 
+#include <stdbool.h>
+#include "qsort.h"
+
+static inline int depCmp(size_t i, size_t j, const char **names, const char **versions, int *flags)
+{
+    int cmp = strcmp(names[i], names[j]);
+    if (cmp) return cmp;
+    bool hasVer1 = flags[i] & RPMSENSE_SENSEMASK;
+    bool hasVer2 = flags[j] & RPMSENSE_SENSEMASK;
+    cmp = hasVer1 - hasVer2;
+    if (cmp) return cmp;
+    // Neither has a version?
+    if (!hasVer1) return cmp;
+    // Both have versions.
+    return strcmp(versions[i], versions[j]);
+}
+
+static inline void depSwap(size_t i, size_t j, const char **names, const char **versions, int *flags)
+{
+    const char *tmpName, *tmpVersion; int tmpFlags;
+    tmpName =  names[i], tmpVersion  = versions[i], tmpFlags = flags[i];
+    names[i] = names[j], versions[i] = versions[j], flags[i] = flags[j];
+    names[j] = tmpName,  versions[j] = tmpVersion,  flags[j] = tmpFlags;
+}
+
+void sortDeps(int n, const char **names, const char **versions, int *flags)
+{
+#define DEP_LESS(i, j) depCmp(i, j, names, versions, flags) < 0
+#define DEP_SWAP(i, j) depSwap(i, j, names, versions, flags)
+    QSORT(n, DEP_LESS, DEP_SWAP);
+}
+
 int verbose;
 
 void addHeader(Header h)
