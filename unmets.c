@@ -231,12 +231,164 @@ void addReq(Header h, int pkgIx)
     rpmtdFreeData(&td3);
 }
 
+void addProv(Header h)
+{
+    struct rpmtd_s td1, td2, td3;
+    int rc = headerGet(h, RPMTAG_PROVIDENAME, &td1, HEADERGET_MINMEM);
+    // Assume that Provides must be present, due to "Provides: %name = %EVR".
+    assert(rc == 1);
+    assert(td1.count > 0);
+    int n = td1.count;
+    assert(td1.type == RPM_STRING_ARRAY_TYPE);
+    const char **names = td1.data;
+
+    rc = headerGet(h, RPMTAG_PROVIDEVERSION, &td2, HEADERGET_MINMEM);
+    assert(rc == 1);
+    assert(td2.count == n);
+    assert(td2.type == RPM_STRING_ARRAY_TYPE);
+    const char **versions = td2.data;
+
+    rc = headerGet(h, RPMTAG_PROVIDEFLAGS, &td3, HEADERGET_MINMEM);
+    assert(rc == 1);
+    assert(td3.count == n);
+    assert(td3.type == RPM_INT32_TYPE);
+    int *flags = td3.data;
+
+    sortDeps(n, names, versions, flags);
+
+    // Load filenames.
+    struct rpmtd_s td4, td5, td6;
+    int bnc = 0;
+    const char **bn = NULL, **dn = NULL;
+    int *di = NULL;
+    if (headerGet(h, RPMTAG_BASENAMES, &td4, HEADERGET_MINMEM) == 1) {
+	assert(td4.type == RPM_STRING_ARRAY_TYPE);
+	assert(td4.count > 0);
+	bnc = td4.count;
+	bn = td4.data;
+
+	rc = headerGet(h, RPMTAG_DIRNAMES, &td5, HEADERGET_MINMEM);
+	assert(rc == 1);
+	assert(td5.type == RPM_STRING_ARRAY_TYPE);
+	assert(td5.count > 0);
+	dn = td5.data;
+
+	rc = headerGet(h, RPMTAG_DIRINDEXES, &td6, HEADERGET_MINMEM);
+	assert(rc == 1);
+	assert(td6.type == RPM_INT32_TYPE);
+	assert(td6.count == bnc);
+	di = td6.data;
+    }
+
+    // Filename stuff.
+    char fname[4096];
+    size_t fnameLen = 0;
+    bool validFname = false;
+    int lastDi = -1;
+    size_t dirLen = 0;
+
+    // Either last Provides or fname.
+    const char *lastName = NULL;
+    char lastNameBuf[4096];
+    size_t lastNameLen = 0, lastLcpLen = 0;
+
+    // Merge Provides with filenames.
+    char *p = frame, *end = p + sizeof frame;
+    int i = 0, j = 0;
+    while (i < n || j < bnc) {
+	// Generate or update filename.
+	if (j < bnc && !validFname) {
+	    validFname = true;
+	    if (lastDi != di[j]) {
+		lastDi = di[j];
+		dirLen = strlen(dn[lastDi]);
+		assert(dirLen < 4096);
+		memcpy(fname, dn[lastDi], dirLen);
+	    }
+	    size_t bnLen = strlen(bn[j]);
+	    assert(dirLen + bnLen < 4096);
+	    memcpy(fname + dirLen, bn[j], bnLen + 1);
+	    fnameLen = dirLen + bnLen;
+	}
+	// Find out name/version/sense to be encoded.
+	const char *name = NULL, *version = NULL;
+	size_t nameLen = 0;
+	unsigned sense = 0;
+	if (i < n && j < bnc) {
+	    int cmp = strcmp(names[i], fname);
+	    if (cmp <= 0) {
+		// Take Provides.
+		name = names[i], nameLen = strlen(name);
+		version = versions[i], sense = (flags[i] & RPMSENSE_SENSEMASK) >> 1;
+		i++;
+		// Advance filenames as well?
+		if (cmp == 0)
+		    j++, validFname = false;
+	    }
+	    else {
+		// Take Filename, leave Provides for the next iteration.
+		name = fname, nameLen = fnameLen, validFname = false;
+		j++;
+	    }
+	}
+	else if (i < n) {
+	    name = names[i], nameLen = strlen(name);
+	    version = versions[i], sense = (flags[i] & RPMSENSE_SENSEMASK) >> 1;
+	    i++;
+	}
+	else {
+	    assert(j < bnc);
+	    name = fname, nameLen = fnameLen, validFname = false;
+	    j++;
+	}
+	// Make a token.
+	assert(nameLen > 0);
+	assert(nameLen < 4096);
+	size_t lcpLen = i || j ? lcp(lastName, lastNameLen, name, nameLen) : 0;
+	int delta = (int) lcpLen - (int) lastLcpLen;
+	size_t len1 = nameLen - lcpLen;
+	struct provToken token = {
+	    .sense = sense,
+	    .delta = delta,
+	    .len = len1,
+	};
+	// Put the record.
+	assert(p + 4 + (sense ? 4 : 0) + len1 < end);
+	memcpy(p, &token, 4);
+	p += 4;
+	if (sense) {
+	    // Put version.
+	    size_t vlen = strlen(version);
+	    assert(depVerPos + vlen + 1 < sizeof depVerTab);
+	    memcpy(depVerTab + depVerPos, version, vlen + 1);
+	    memcpy(p, &depVerPos, 4);
+	    depVerPos += vlen + 1;
+	    p += 4;
+	}
+	memcpy(p, name + lcpLen, len1);
+	p += len1;
+	// Copy fname for lastName.
+	lastName = name == fname ? memcpy(lastNameBuf, name, nameLen + 1) : name;
+	lastNameLen = nameLen, lastLcpLen = lcpLen;
+    }
+
+    rpmtdFreeData(&td1);
+    rpmtdFreeData(&td2);
+    rpmtdFreeData(&td3);
+    if (bnc) {
+	rpmtdFreeData(&td4);
+	rpmtdFreeData(&td5);
+	rpmtdFreeData(&td6);
+    }
+}
+
 int verbose;
 
 void addHeader(Header h)
 {
     int pkgIx = addPkg(h);
     addReq(h, pkgIx);
+    addProv(h);
     if (verbose > 1)
 	fprintf(stderr, "loaded %s\n", pkgNameTab + pkgIxTab[pkgIx]);
 }
