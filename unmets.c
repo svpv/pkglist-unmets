@@ -39,13 +39,15 @@ int addVer(const char *ver)
     hash = 33 * hash + b1;
     hash = 33 * hash + b2;
     // Lookup up in the cache.
-    static int lookup[1<<17];
-    int *vposp = &lookup[hash % (1<<17)];
-    int vpos = *vposp;
-    if (vpos && strcmp(ver, depVerTab + vpos) == 0)
-	return vpos;
+    static int lookup[1<<16][2];
+    int *va = lookup[hash % (1<<16)];
+    if (va[0] && memcmp(ver, depVerTab + vposa[0], vlen + 1) == 0)
+	return va[0];
+    if (va[1] && memcmp(ver, depVerTab + vposa[1], vlen + 1) == 0)
+	return va[1];
     // Store in the cache.
-    vpos = *vposp = depVerPos;
+    va[1] = vposa[0];
+    int vpos = va[0] = depVerPos;
     assert(vpos + vlen + 1 < sizeof depVerTab);
     memcpy(depVerTab + vpos, ver, vlen + 1);
     depVerPos += vlen + 1;
