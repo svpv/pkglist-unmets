@@ -21,14 +21,36 @@
 // I don't use "static" in this program to indicate file scope.
 // The program is supposed to be compiled with -fwhole-program.
 
-// The string tabs for %{RequireVersion} and %{ProvideVersion}.
-// Since they are mostly occupied by set-versions, I make no
-// attempts to find dups.
-char depVerTab[256<<20];
-int depVerPos;
-
 #include <string.h>
 #include <assert.h>
+
+// The string tabs for %{RequireVersion} and %{ProvideVersion}.
+char depVerTab[256<<20];
+int depVerPos = 1;
+
+int addVer(const char *ver)
+{
+    size_t vlen = strlen(ver);
+    assert(vlen);
+    // Hash the version.
+    unsigned b1 = (unsigned char) ver[vlen/2+0];
+    unsigned b2 = (unsigned char) ver[vlen/2+1];
+    unsigned hash = vlen;
+    hash = 33 * hash + b1;
+    hash = 33 * hash + b2;
+    // Lookup up in the cache.
+    static int lookup[1<<17];
+    int *vposp = &lookup[hash % (1<<17)];
+    int vpos = *vposp;
+    if (vpos && strcmp(ver, depVerTab + vpos) == 0)
+	return vpos;
+    // Store in the cache.
+    vpos = *vposp = depVerPos;
+    assert(vpos + vlen + 1 < sizeof depVerTab);
+    memcpy(depVerTab + vpos, ver, vlen + 1);
+    depVerPos += vlen + 1;
+    return vpos;
+}
 
 // This program builds and processes two big sequences: the sequence
 // of Requires and the sequence of Provides (the latter also includes
@@ -214,11 +236,8 @@ void addReq(Header h, int pkgIx)
 	p += 6;
 	if (sense) {
 	    // Put version.
-	    size_t vlen = strlen(versions[i]);
-	    assert(depVerPos + vlen + 1 < sizeof depVerTab);
-	    memcpy(depVerTab + depVerPos, versions[i], vlen + 1);
-	    memcpy(p, &depVerPos, 4);
-	    depVerPos += vlen + 1;
+	    int vpos = addVer(versions[i]);
+	    memcpy(p, &vpos, 4);
 	    p += 4;
 	}
 	memcpy(p, names[i] + lcpLen, len1);
@@ -358,11 +377,8 @@ void addProv(Header h)
 	p += 4;
 	if (sense) {
 	    // Put version.
-	    size_t vlen = strlen(version);
-	    assert(depVerPos + vlen + 1 < sizeof depVerTab);
-	    memcpy(depVerTab + depVerPos, version, vlen + 1);
-	    memcpy(p, &depVerPos, 4);
-	    depVerPos += vlen + 1;
+	    int vpos = addVer(version);
+	    memcpy(p, &vpos, 4);
 	    p += 4;
 	}
 	memcpy(p, name + lcpLen, len1);
@@ -433,8 +449,9 @@ int main(int argc, char **argv)
     }
     Fclose(Fd);
     if (verbose)
-	fprintf(stderr, "loaded %d headers (%dM out of %zuM pkgTab)\n", pkgIxPos,
-			1 + (pkgNamePos >> 20), sizeof pkgNameTab >> 20);
+	fprintf(stderr, "loaded %d headers (%.1fM out of %zuM pkgTab, %.1fM out of %zuM verTab)\n", pkgIxPos,
+			(double) pkgNamePos / (1 << 20), sizeof pkgNameTab >> 20,
+			(double) depVerPos / (1 << 20), sizeof depVerTab >> 20);
     return 0;
 }
 
