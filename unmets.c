@@ -332,6 +332,57 @@ char *addFnames(Header h, char *p, char *end)
     return p;
 }
 
+// Dump a packed [p,end) sequence to stdout.  Useful for debugging,
+// e.g. the dump can be compared to /usr/bin/pkglist-query output.
+void dumpSeq(const char *p, const char *end, bool isReq)
+{
+    char name[4096];
+    size_t lastLcpLen = 0;
+    while (1) {
+	struct depToken token;
+	assert(p + 4 <= end);
+	memcpy(&token, p, 4), p += 4;
+	// ver
+	const char *ver = NULL;
+	if (token.sense) {
+	    int verIx;
+	    assert(p + 4 <= end);
+	    memcpy(&verIx, p, 4), p += 4;
+	    assert(verIx < strtabPos);
+	    ver = strtab + verIx;
+	}
+	// pkg
+	if (isReq) {
+	    int pkgIx;
+	    assert(p + 4 <= end);
+	    memcpy(&pkgIx, p, 4), p += 4;
+	    assert(pkgIx < strtabPos);
+	    fputs(strtab + pkgIx, stdout);
+	    putchar('\t');
+	}
+	// name
+	size_t lcpLen = (int) lastLcpLen + token.delta;
+	assert(p + token.len <= end);
+	memcpy(name + lcpLen, p, token.len);
+	p += token.len;
+	name[lcpLen + token.len] = '\0';
+	if (!token.sense)
+	    puts(name);
+	else {
+	    fputs(name, stdout);
+	    putchar(' ');
+	    if (token.sense & RPMSENSE_LESS)	putchar('<');
+	    if (token.sense & RPMSENSE_GREATER)	putchar('>');
+	    if (token.sense & RPMSENSE_EQUAL)	putchar('=');
+	    putchar(' ');
+	    puts(ver);
+	}
+	lastLcpLen = lcpLen;
+	if (p == end)
+	    break;
+    }
+}
+
 int verbose;
 int npkg;
 
