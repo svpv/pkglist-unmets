@@ -383,6 +383,91 @@ void dumpSeq(const char *p, const char *end, bool isReq)
     }
 }
 
+// Merge seq1 + seq2 into p.  The output size is bounded by seq1 + seq2.
+char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char *end2, bool isReq, char *p)
+{
+    bool valid1 = false, valid2 = false;
+    char name1[4096], name2[4096], lastName[4096];
+    size_t name1len = 0, name2len = 0, lastNameLen = 0;
+    size_t lcp1len = 0, lcp2len = 0, lastLcpLen = 0;
+    int ver1 = 0, ver2 = 0;
+    int sense1 = 0, sense2 = 0;
+    int pkg1 = 0, pkg2 = 0;
+#define decodeDep(N)					\
+    do {						\
+	valid##N = true;				\
+	struct depToken token;				\
+	memcpy(&token, seq##N, 4), seq##N += 4;		\
+	sense##N = token.sense;				\
+	if (sense##N)					\
+	    memcpy(&ver##N, seq##N, 4), seq##N += 4;	\
+	if (isReq)					\
+	    memcpy(&pkg##N, seq##N, 4), seq##N += 4;	\
+	lcp##N##len += token.delta;			\
+	size_t len = token.len;				\
+	memcpy(name##N + lcp##N##len, seq##N, len);	\
+	seq##N += len;					\
+	name##N##len = lcp##N##len + len;		\
+	name##N[name##N##len] = '\0';			\
+    } while (0)
+    while (seq1 < end1 || seq2 < end2 || valid1 || valid2) {
+	if (seq1 < end1 && !valid1)
+	    decodeDep(1);
+	if (seq2 < end2 && !valid2)
+	    decodeDep(2);
+	int cmp = valid1 && valid2 ? strcmp(name1, name2) :
+		  valid1 ? -1 : 1;
+	// If the name is the same, order by having version.
+	if (cmp == 0) {
+	    cmp = (bool) sense1 - (bool) sense2;
+	    // If both have versions, order by version.
+	    if (cmp == 0 && sense1)
+		cmp = ver1 - ver2;
+	    // As a last resort, Requires are ordered by pkg.
+	    if (cmp == 0 && isReq)
+		cmp = pkg1 - pkg2;
+	}
+	const char *name = NULL;
+	size_t nameLen = 0;
+	int ver = 0;
+	int sense = 0;
+	int pkg = 0;
+	if (cmp <= 0) {
+	    name = name1, nameLen = name1len, ver = ver1, sense = sense1, pkg = pkg1;
+	    valid1 = false;
+	    // Fold identical dependencies, typically Provides
+	    // (e.g. i586-wine Provides: wine = %EVR).
+	    if (cmp == 0)
+		valid2 = false;
+	}
+	else {
+	    name = name2, nameLen = name2len, ver = ver2, sense = sense2, pkg = pkg2;
+	    valid2 = false;
+	}
+	// Make a token.
+	size_t lcpLen = lastNameLen ? lcp(lastName, lastNameLen, name, nameLen) : 0;
+	int delta = (int) lcpLen - (int) lastLcpLen;
+	size_t len1 = nameLen - lcpLen;
+	struct depToken token = {
+	    .sense = sense,
+	    .delta = delta,
+	    .len = len1,
+	};
+	// Put the record.
+	memcpy(p, &token, 4), p += 4;
+	if (sense)
+	    memcpy(p, &ver, 4), p += 4;
+	if (isReq)
+	    memcpy(p, &pkg, 4), p += 4;
+	memcpy(p, name + lcpLen, len1);
+	p += len1;
+	// Copy lastName for the next iteration.
+	memcpy(lastName, name, nameLen + 1);
+	lastNameLen = nameLen, lastLcpLen = lcpLen;
+    }
+    return p;
+}
+
 int verbose;
 int npkg;
 
