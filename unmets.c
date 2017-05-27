@@ -468,17 +468,93 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
     return p;
 }
 
+// There are 3 buffers for sequences: one for the Requires sequence,
+// another for the Provides sequence, and one more that is used as an
+// output buffer during merges.  The result of a merge which affects only
+// a part of the buffer (i.e. the buffer has more than 2 subsequences,
+// the two rightmost being merged) is copied back to the original
+// buffer; however, when the buffer has only two subsequences to merge,
+// the original buffer and the output buffer switch their places after
+// such a merge.
+#define SEQBUFSIZE (64<<20)
+char seqBuf1[SEQBUFSIZE], seqBuf2[SEQBUFSIZE], seqBuf3[SEQBUFSIZE];
+char *reqSeq = seqBuf1, *provSeq = seqBuf2, *tmpSeq = seqBuf3;
+int reqFill, provFill;
+
+// When a package is first processed, its Requires (Provides) sequence
+// is appended to reqSeq (resp. provSeq) at reqOff=reqFill (resp.
+// provOff=provFill).  The corresponding entry is pushed onto the stack,
+// with npkg=1 set.  Then follows a series of balanced merges, e.g. 1+1,
+// which means that if the two topmost stack entries both have npkg=1, they
+// are popped off the stack, their sequences are merged, and the resulting
+// entry with npkg=2 is pushed back to the stack; then 2+2, and so on.
+// At some point, the stack will have entries with the following npkg values,
+// from top to bottom: 1 2 4 ... n; pushing one more package will trigger a
+// cascade of merges which will result in a single stack entry with npkg=2n.
+struct stackEnt {
+    int npkg;
+    int reqOff, provOff;
+};
+
+// With the stack depth of 30, up to a billion packages can be processed.
+// The real limitation lies within the strtab size and SEQBUFSIZE.
+struct stackEnt stack[30];
+int nstack;
+
+// Merge the two topmost stack entries.
+void mergeStack(void)
+{
+#define mergeDep(dep, isReq)							\
+    do {								\
+	int off1 = stack[nstack-1].dep##Off;				\
+	int off2 = stack[nstack-2].dep##Off;				\
+	int fill = mergeSeq(dep##Seq + off1, dep##Seq + dep##Fill,	\
+			    dep##Seq + off2, dep##Seq + off1,		\
+			    isReq, tmpSeq) - tmpSeq;			\
+	if (nstack > 2) /* copy back */					\
+	    memcpy(dep##Seq + off2, tmpSeq, fill);			\
+	else { /* switch places */					\
+	    char *p = dep##Seq;						\
+	    dep##Seq = tmpSeq, tmpSeq = p;				\
+	}								\
+	dep##Fill = off2 + fill;					\
+    } while (0)
+    mergeDep(req, true);
+    mergeDep(prov, false);
+    stack[nstack-2].npkg += stack[nstack-1].npkg;
+    nstack--;
+}
+
 int verbose;
 int npkg;
 
-char frame[8<<20];
-
 void addHeader(Header h)
 {
+    // Add the package.
     int pkgIx = addPkg(h);
-    addReq(h, pkgIx, frame, frame + sizeof frame);
-    addProv(h, frame, frame + sizeof frame);
-    addFnames(h, frame, frame + sizeof frame);
+    // Add Requires.
+    int reqOff = reqFill;
+    reqFill = addReq(h, pkgIx, reqSeq + reqFill, reqSeq + SEQBUFSIZE) - reqSeq;
+    // Add Provides.
+    int prov2off = provFill;
+    provFill = addProv(h, provSeq + provFill, provSeq + SEQBUFSIZE) - provSeq;
+    // Add Filenames.
+    int prov1off = provFill;
+    provFill = addFnames(h, provSeq + provFill, provSeq + SEQBUFSIZE) - provSeq;
+    // Merge Provides+Filenames.
+    if (provFill > prov1off) {
+	int fill = mergeSeq(provSeq + prov1off, provSeq + provFill,
+			    provSeq + prov2off, provSeq + prov1off,
+			    false, tmpSeq) - tmpSeq;
+	memcpy(provSeq + prov2off, tmpSeq, fill);
+	provFill = prov2off + fill;
+    }
+    // Push onto the stack.
+    stack[nstack++] = (struct stackEnt) { 1, reqOff, prov2off };
+    // Run merges.
+    while (nstack > 1 && stack[nstack-1].npkg >= stack[nstack-2].npkg)
+	mergeStack();
+    // It's done when it's done.
     if (verbose > 1)
 	fprintf(stderr, "loaded %s\n", strtab + pkgIx);
     npkg++;
@@ -523,9 +599,15 @@ int main(int argc, char **argv)
 	headerFree(h);
     }
     Fclose(Fd);
+    // Run the final series of merges.
+    while (nstack > 1)
+	mergeStack();
     if (verbose)
-	fprintf(stderr, "loaded %d headers (%.1fM strtab)\n", npkg,
-			(double) strtabPos / (1 << 20));
+	fprintf(stderr, "loaded %d headers (%.1fM strtab, %.1fM req, %.1fM prov)\n",
+			 npkg,
+			(double) strtabPos / (1 << 20),
+			(double) reqFill / (1 << 20),
+			(double) provFill / (1 << 20));
     return 0;
 }
 
