@@ -563,7 +563,12 @@ void addHeader(Header h)
 #include <stdbool.h>
 #include <getopt.h>
 
+int dump_requires;
+int dump_provides;
+
 const struct option longopts[] = {
+    { "dump-requires", no_argument, &dump_requires, 1 },
+    { "dump-provides", no_argument, &dump_provides, 1 },
     { "help", no_argument, NULL, 'h' },
     { "verbose", no_argument, NULL, 'v' },
     { NULL },
@@ -576,6 +581,8 @@ int main(int argc, char **argv)
     int c;
     while ((c = getopt_long(argc, argv, "v", longopts, NULL)) != -1) {
 	switch (c) {
+	case 0:
+	    break;
 	case 'v':
 	    verbose++;
 	    break;
@@ -584,6 +591,10 @@ int main(int argc, char **argv)
 	}
     }
     argc -= optind, argv += optind;
+    if (dump_requires && dump_provides) {
+	fprintf(stderr, "%s: --dump-requires and --dump-provides are mutually exclusive\n", argv0);
+	usage = 1;
+    }
     if (argc && !usage) {
 	fprintf(stderr, "%s: too many arguments\n", argv0);
 	usage = 1;
@@ -608,6 +619,10 @@ int main(int argc, char **argv)
 			(double) strtabPos / (1 << 20),
 			(double) reqFill / (1 << 20),
 			(double) provFill / (1 << 20));
+    if (dump_requires)
+	dumpSeq(reqSeq, reqSeq + reqFill, true);
+    else if (dump_provides)
+	dumpSeq(provSeq, provSeq + provFill, false);
     return 0;
 }
 
