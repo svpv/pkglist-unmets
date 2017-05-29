@@ -606,6 +606,15 @@ int main(int argc, char **argv)
     FD_t Fd = fdDup(0);
     Header h;
     while ((h = headerRead(Fd, HEADER_MAGIC_YES))) {
+	if (npkg == 0) {
+	    // Smuggle rpmilb Provides with the frist package.
+	    rpmds ds = NULL;
+	    int rc = rpmdsRpmlib(&ds, NULL);
+	    assert(rc == 0 && ds);
+	    rc = rpmdsPutToHeader(ds, h);
+	    assert(rc == 0);
+	    rpmdsFree(ds);
+	}
 	addHeader(h);
 	headerFree(h);
     }
