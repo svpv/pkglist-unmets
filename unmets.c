@@ -393,12 +393,12 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
     int ver1 = 0, ver2 = 0;
     int sense1 = 0, sense2 = 0;
     int pkg1 = 0, pkg2 = 0;
-#define decodeDep(N)					\
+#define decodeDep(N, isReq)				\
     do {						\
-	valid##N = true;				\
 	struct depToken token;				\
 	memcpy(&token, seq##N, 4), seq##N += 4;		\
 	sense##N = token.sense;				\
+	ver##N = 0;					\
 	if (sense##N)					\
 	    memcpy(&ver##N, seq##N, 4), seq##N += 4;	\
 	if (isReq)					\
@@ -411,10 +411,14 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	name##N[name##N##len] = '\0';			\
     } while (0)
     while (seq1 < end1 || seq2 < end2 || valid1 || valid2) {
-	if (seq1 < end1 && !valid1)
-	    decodeDep(1);
-	if (seq2 < end2 && !valid2)
-	    decodeDep(2);
+	if (seq1 < end1 && !valid1) {
+	    valid1 = true;
+	    decodeDep(1, isReq);
+	}
+	if (seq2 < end2 && !valid2) {
+	    valid2 = true;
+	    decodeDep(2, isReq);
+	}
 	int cmp = valid1 && valid2 ? strcmp(name1, name2) :
 		  valid1 ? -1 : 1;
 	// If the name is the same, order by having version.
@@ -466,6 +470,155 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	lastNameLen = nameLen, lastLcpLen = lcpLen;
     }
     return p;
+}
+
+// Print an unmet dependency.
+void unmet1(int pkg, const char *name, int ver, int sense)
+{
+    assert(pkg < sizeof strtab);
+    fputs(strtab + pkg, stdout);
+    putchar('\t');
+    if (sense == 0)
+	puts(name);
+    else {
+	fputs(name, stdout);
+	putchar(' ');
+	if (sense & RPMSENSE_LESS)	putchar('<');
+	if (sense & RPMSENSE_GREATER)	putchar('>');
+	if (sense & RPMSENSE_EQUAL)	putchar('=');
+	putchar(' ');
+	assert(ver < sizeof strtab);
+	puts(strtab + ver);
+    }
+}
+
+// This sucks more than anything that has ever sucked before.
+#include <rpm/rpmstrpool.h>
+
+// Try to satisfy R with P.
+bool satisfy(rpmstrPool *poolp, rpmds *dsRp, int verR, int senseR, int verP, int senseP)
+{
+    // The routine should only be called for versioned Requires.
+    // This is unlike unversioned provides, which can satsisfy
+    // the peculiar dependencies "python(foo) < 0" used by imz.
+    assert(senseR);
+
+    // Equal version strings => equal versions.
+    if (senseR == RPMSENSE_EQUAL && senseP == RPMSENSE_EQUAL)
+	if (strcmp(strtab + verR, strtab + verP) == 0)
+	    return true;
+
+    rpmstrPool pool = *poolp;
+    if (!pool)
+	pool = *poolp = rpmstrPoolCreate();
+    rpmds dsR = *dsRp;
+    if (!dsR)
+	dsR = *dsRp = rpmdsSinglePool(pool, RPMTAG_REQUIRENAME, "", strtab + verR, senseR);
+    rpmds dsP = rpmdsSinglePool(pool, RPMTAG_PROVIDENAME, "", strtab + verP, senseP);
+    bool ret = rpmdsCompare(dsP, dsR);
+    rpmdsFree(dsP);
+    return ret;
+}
+
+// Join {R,P} and print unmet dependencies.  There are two kinds of unmet dependencies:
+// - when R.name is not in P, it's a name-only unmet dependency;
+// - otherwise, the dependency can be unmet due to {R.ver,P.ver} version check.
+void unmets(const char *seqR, const char *endR, const char *seqP, const char *endP)
+{
+    char nameR[4096], nameP[4096];
+    size_t nameRlen = 0, namePlen = 0;
+    size_t lcpRlen = 0, lcpPlen = 0;
+    int verR = 0, verP = 0;
+    int senseR = 0, senseP = 0;
+    int pkgR = 0, pkgP = 0;
+    decodeDep(R, true);
+    decodeDep(P, false);
+    int cmp = strcmp(nameP, nameR);
+    while (1) {
+	// Skip unused provides.
+	while (cmp < 0) {
+	    if (seqP == endP)
+		break;
+	    decodeDep(P, false);
+	    cmp = strcmp(nameP, nameR);
+	}
+	// No more Provides, but some Requires left?
+	if (cmp < 0)
+	    // Print name-only unmet Requires.
+	    while (1) {
+		unmet1(pkgR, nameR, 0, 0);
+		if (seqR == endR)
+		    return;
+		decodeDep(R, true);
+	    }
+	// Prov > Req?  Print name-only unmet Requires.
+	while (cmp > 0) {
+	    unmet1(pkgR, nameR, 0, 0);
+	    if (seqR == endR)
+		break;
+	    decodeDep(R, true);
+	    cmp = strcmp(nameP, nameR);
+	}
+	// No more Requires left?
+	if (cmp > 0)
+	    return;
+	// Prov < Req?  Next Provides.
+	if (cmp < 0)
+	    continue;
+	// The two names match.  Now skip Requires without a version.
+	while (senseR == 0) {
+	    // No more Requires left?
+	    if (seqR == endR)
+		return;
+	    decodeDep(R, true);
+	    cmp = strcmp(nameP, nameR);
+	    if (cmp)
+		break;
+	}
+	// All the Requires were versionless?
+	if (cmp)
+	    continue;
+	// For each Requires, iterate over Provides with the same name.
+	rpmstrPool pool = NULL;
+	do {
+	    rpmds dsR = NULL;
+	    bool happy = satisfy(&pool, &dsR, verR, senseR, verP, senseP);
+	    if (!happy && seqP < endP) {
+		const char *seqP1 = seqP;
+		char nameP1[4096];
+		int pkgP1, verP1 = 0, senseP1 = 0;
+		size_t nameP1len = namePlen, lcpP1len = lcpPlen;
+		memcpy(nameP1, nameP, namePlen + 1);
+		while (1) {
+		    decodeDep(P1, false);
+		    int cmp1 = strcmp(nameP, nameP1);
+		    if (cmp1)
+			break;
+		    happy = satisfy(&pool, &dsR, verR, senseR, verP1, senseP1);
+		    if (happy || seqP1 == endP)
+			break;
+		}
+	    }
+	    rpmdsFree(dsR);
+	    // Going to load the next Requires.
+	    int senseR1 = senseR, verR1 = verR;
+	    do {
+		// Show if the dependency is unmet.
+		if (!happy)
+		    unmet1(pkgR, nameR, verR, senseR);
+		// No more Requires left?
+		if (seqR == endR) {
+		    rpmstrPoolFree(pool);
+		    return;
+		}
+		decodeDep(R, true);
+		cmp = strcmp(nameP, nameR);
+		// Fast-forward if it's the same Requires (from another package).
+	    } while (cmp == 0 && senseR == senseR1 && verR == verR1);
+	    // Proceed if the Requires name is the same.
+	} while (cmp == 0);
+	rpmstrPoolFree(pool);
+    }
 }
 
 // There are 3 buffers for sequences: one for the Requires sequence,
@@ -632,6 +785,8 @@ int main(int argc, char **argv)
 	dumpSeq(reqSeq, reqSeq + reqFill, true);
     else if (dump_provides)
 	dumpSeq(provSeq, provSeq + provFill, false);
+    else
+	unmets(reqSeq, reqSeq + reqFill, provSeq, provSeq + provFill);
     return 0;
 }
 
