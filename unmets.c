@@ -147,7 +147,9 @@ static inline int depCmp(size_t i, size_t j, const char **names, const char **ve
     if (cmp) return cmp;
     bool hasVer1 = flags[i] & RPMSENSE_SENSEMASK;
     bool hasVer2 = flags[j] & RPMSENSE_SENSEMASK;
-    cmp = hasVer1 - hasVer2;
+    // Deps with version go before the versionless ones.
+    // This way, the latter are easier to discard.
+    cmp = hasVer2 - hasVer1;
     if (cmp) return cmp;
     // Neither has a version?
     if (!hasVer1) return cmp;
@@ -212,6 +214,13 @@ char *addDeps(Header h, int pkgIx, char *p, char *end)
 	size_t nameLen = strlen(names[i]);
 	assert(nameLen < 4096);
 	size_t lcpLen = i ? lcp(names[i-1], lastNameLen, names[i], nameLen) : 0;
+	// RequireName not changed?
+	bool sameName = lcpLen == nameLen && nameLen == lastNameLen;
+	if (pkgIx && sameName)
+	    // No version? It must be a dup then, as per depCmp ordering.
+	    // E.g. "Requires: /bin/sh" and "Requires(pre): /bin/sh".
+	    if (sense == 0)
+		continue;
 	int delta = (int) lcpLen - (int) lastLcpLen;
 	size_t len1 = nameLen - lcpLen;
 	struct depToken token = {
@@ -219,12 +228,6 @@ char *addDeps(Header h, int pkgIx, char *p, char *end)
 	    .delta = delta,
 	    .len = len1,
 	};
-	// RequireName not changed?
-	if (pkgIx && delta == 0 && len1 == 0)
-	    // No version? It must be a dup then, as per depCmp ordering.
-	    // E.g. "Requires: /bin/sh" and "Requires(pre): /bin/sh".
-	    if (sense == 0)
-		continue;
 	// Put the record.
 	assert(p + 4 + (sense ? 4 : 0) + (pkgIx ? 4 : 0) + len1 < end);
 	memcpy(p, &token, 4);
