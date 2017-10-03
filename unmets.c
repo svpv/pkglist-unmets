@@ -26,7 +26,7 @@
 
 // The string tab for %{Name}+%{EVR}, %{RequireVersion} and %{ProvideVersion}.
 char strtab[256<<20];
-int strtabPos = 1;
+int strtabPos = 1; // Any reference is non-zero.
 
 int *lookupStrtab(const char *ver, size_t vlen)
 {
@@ -151,7 +151,7 @@ static inline int depCmp(size_t i, size_t j, const char **names, const char **ve
     if (cmp) return cmp;
     // Neither has a version?
     if (!hasVer1) return cmp;
-    // Both have versions.
+    // Both have versions.  Any ordering would do.
     return strcmp(versions[i], versions[j]);
 }
 
@@ -535,7 +535,7 @@ void unmets(const char *seqR, const char *endR, const char *seqP, const char *en
     decodeDep(P, false);
     int cmp = strcmp(nameP, nameR);
     while (1) {
-	// Skip unused provides.
+	// Skip unused Provides.
 	while (cmp < 0) {
 	    if (seqP == endP)
 		break;
