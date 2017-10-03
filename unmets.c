@@ -469,7 +469,7 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	memcpy(p, name + lcpLen, len1);
 	p += len1;
 	// Copy lastName for the next iteration.
-	memcpy(lastName, name, nameLen + 1);
+	memcpy(lastName + lcpLen, name + lcpLen, len1 + 1);
 	lastNameLen = nameLen, lastLcpLen = lcpLen;
     }
     return p;
