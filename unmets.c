@@ -101,10 +101,10 @@ struct depToken {
     // 0 = no version
     unsigned sense: 4;
     // A sequence of dependencies is sorted by name; the names are further
-    // front-encoded, roughly like in locatedb(5).  The delta field uses the
-    // range of [-4095,4095] to encode the change in the common prefix length;
-    // the value of -4096, if ever used, should reset the prefix length to 0.
-    int delta: 13;
+    // front-encoded, roughly like in locatedb(5).  This lcpLen field encodes
+    // the length of the common prefix with the preceding name ("lcp" stands
+    // for "the longest common prefix").
+    unsigned lcpLen: 12;
     // This is the length of the rest of the name after the common prefix.
     // The name is stored after the 4-byte version, without a terminating
     // '\0' character (thus when len is 0, nothing is stored).  In the worst
@@ -207,7 +207,7 @@ char *addDeps(Header h, int pkgIx, char *p, char *end)
 
     sortDeps(n, names, versions, flags);
 
-    size_t lastNameLen = 0, lastLcpLen = 0;
+    size_t lastNameLen = 0;
     for (int i = 0; i < n; i++) {
 	// Make a token.
 	unsigned sense = flags[i] & (RPMSENSE_LESS | RPMSENSE_GREATER | RPMSENSE_EQUAL);
@@ -221,13 +221,8 @@ char *addDeps(Header h, int pkgIx, char *p, char *end)
 	    // E.g. "Requires: /bin/sh" and "Requires(pre): /bin/sh".
 	    if (sense == 0)
 		continue;
-	int delta = (int) lcpLen - (int) lastLcpLen;
 	size_t len1 = nameLen - lcpLen;
-	struct depToken token = {
-	    .sense = sense,
-	    .delta = delta,
-	    .len = len1,
-	};
+	struct depToken token = { .sense = sense, .lcpLen = lcpLen, .len = len1 };
 	// Put the record.
 	assert(p + 4 + (sense ? 4 : 0) + (pkgIx ? 4 : 0) + len1 < end);
 	memcpy(p, &token, 4);
@@ -243,7 +238,7 @@ char *addDeps(Header h, int pkgIx, char *p, char *end)
 	}
 	memcpy(p, names[i] + lcpLen, len1);
 	p += len1;
-	lastNameLen = nameLen, lastLcpLen = lcpLen;
+	lastNameLen = nameLen;
     }
 
     rpmtdFreeData(&td1);
@@ -292,7 +287,7 @@ char *addFnames(Header h, char *p, char *end)
     di = td3.data;
 
     char fname[4096], lastFname[4096];
-    size_t fnameLen = 0, lastFnameLen = 0, lastLcpLen = 0;
+    size_t fnameLen = 0, lastFnameLen = 0;
     int lastDi = -1;
     size_t dirLen = 0;
 
@@ -310,13 +305,8 @@ char *addFnames(Header h, char *p, char *end)
 	memcpy(fname + dirLen, bn[i], bnLen + 1);
 	// Make a token.
 	size_t lcpLen = i ? lcp(lastFname, lastFnameLen, fname, fnameLen) : 0;
-	int delta = (int) lcpLen - (int) lastLcpLen;
 	size_t len1 = fnameLen - lcpLen;
-	struct depToken token = {
-	    .sense = 0,
-	    .delta = delta,
-	    .len = len1,
-	};
+	struct depToken token = { .sense = 0, .lcpLen = lcpLen, .len = len1 };
 	// Put the record.
 	assert(p + 4 + len1 < end);
 	memcpy(p, &token, 4);
@@ -325,7 +315,7 @@ char *addFnames(Header h, char *p, char *end)
 	p += len1;
 	// Copy fname to lastFname.
 	memcpy(lastFname, fname, fnameLen + 1);
-	lastFnameLen = fnameLen, lastLcpLen = lcpLen;
+	lastFnameLen = fnameLen;
     }
 
     rpmtdFreeData(&td1);
@@ -340,7 +330,6 @@ char *addFnames(Header h, char *p, char *end)
 void dumpSeq(const char *p, const char *end, bool isReq)
 {
     char name[4096];
-    size_t lastLcpLen = 0;
     while (1) {
 	struct depToken token;
 	assert(p + 4 <= end);
@@ -364,11 +353,10 @@ void dumpSeq(const char *p, const char *end, bool isReq)
 	    putchar('\t');
 	}
 	// name
-	size_t lcpLen = (int) lastLcpLen + token.delta;
 	assert(p + token.len <= end);
-	memcpy(name + lcpLen, p, token.len);
+	memcpy(name + token.lcpLen, p, token.len);
 	p += token.len;
-	name[lcpLen + token.len] = '\0';
+	name[token.lcpLen + token.len] = '\0';
 	if (!token.sense)
 	    puts(name);
 	else {
@@ -380,7 +368,6 @@ void dumpSeq(const char *p, const char *end, bool isReq)
 	    putchar(' ');
 	    puts(ver);
 	}
-	lastLcpLen = lcpLen;
 	if (p == end)
 	    break;
     }
@@ -392,7 +379,7 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
     bool valid1 = false, valid2 = false;
     char name1[4096], name2[4096], lastName[4096];
     size_t name1len = 0, name2len = 0, lastNameLen = 0;
-    size_t lcp1len = 0, lcp2len = 0, lastLcpLen = 0;
+    size_t lcp1len = 0, lcp2len = 0;
     int ver1 = 0, ver2 = 0;
     int sense1 = 0, sense2 = 0;
     int pkg1 = 0, pkg2 = 0;
@@ -406,7 +393,7 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	    memcpy(&ver##N, seq##N, 4), seq##N += 4;	\
 	if (isReq)					\
 	    memcpy(&pkg##N, seq##N, 4), seq##N += 4;	\
-	lcp##N##len += token.delta;			\
+	lcp##N##len = token.lcpLen;			\
 	size_t len = token.len;				\
 	memcpy(name##N + lcp##N##len, seq##N, len);	\
 	seq##N += len;					\
@@ -453,13 +440,8 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	}
 	// Make a token.
 	size_t lcpLen = lastNameLen ? lcp(lastName, lastNameLen, name, nameLen) : 0;
-	int delta = (int) lcpLen - (int) lastLcpLen;
 	size_t len1 = nameLen - lcpLen;
-	struct depToken token = {
-	    .sense = sense,
-	    .delta = delta,
-	    .len = len1,
-	};
+	struct depToken token = { .sense = sense, .lcpLen = lcpLen, .len = len1 };
 	// Put the record.
 	memcpy(p, &token, 4), p += 4;
 	if (sense)
@@ -470,7 +452,7 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	p += len1;
 	// Copy lastName for the next iteration.
 	memcpy(lastName + lcpLen, name + lcpLen, len1 + 1);
-	lastNameLen = nameLen, lastLcpLen = lcpLen;
+	lastNameLen = nameLen;
     }
     return p;
 }
