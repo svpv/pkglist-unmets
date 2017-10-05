@@ -701,6 +701,16 @@ void addHeader(Header h)
 #include <stdbool.h>
 #include <getopt.h>
 
+#ifdef DEBUG
+unsigned djb(const char *p, const char *end)
+{
+    unsigned hash = 5381;
+    while (p < end)
+	hash = 33 * hash + (unsigned char) *p++;
+    return hash;
+}
+#endif
+
 int dump_requires;
 int dump_provides;
 
@@ -760,6 +770,10 @@ int main(int argc, char **argv)
     // Run the final series of merges.
     while (nstack > 1)
 	mergeStack();
+#ifdef DEBUG
+    fprintf(stderr, "reqSeq size=%d hash=%08x\n", reqFill, djb(reqSeq, reqSeq + reqFill));
+    fprintf(stderr, "provSeq size=%d hash=%08x\n", provFill, djb(provSeq, provSeq + provFill));
+#endif
     if (verbose)
 	fprintf(stderr, "loaded %d headers (%.1fM strtab, %.1fM req, %.1fM prov)\n",
 			 npkg,
