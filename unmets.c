@@ -99,7 +99,9 @@ int addPkg(Header h)
 struct depToken {
     // RPMSENSE_LESS | RPMSENSE_GREATER | RPMSENSE_EQUAL
     // 0 = no version
-    unsigned sense: 4;
+    // Only needs 4 bits, more bits are used only for padding,
+    // so that all the bits in the structure are initialized.
+    unsigned sense: 8;
     // A sequence of dependencies is sorted by name; the names are further
     // front-encoded, roughly like in locatedb(5).  This lcpLen field encodes
     // the length of the common prefix with the preceding name ("lcp" stands
