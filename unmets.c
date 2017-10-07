@@ -24,6 +24,31 @@
 #include <string.h>
 #include <assert.h>
 
+// A fast copying routine which can copy more bytes than requested.
+// Works best with short strings when only one iteration may suffice.
+// With constant n, such as n=4, memcpy should still be used.
+#ifdef __SSE2__
+#include <emmintrin.h>
+static inline void copy(void *dst, const void *src, ssize_t n)
+{
+    while (1) {
+	// Using two registers to copy 32 bytes works much faster
+	// than using one register to copy 16 bytes at a time.
+	__m128i xmm0 = _mm_loadu_si128((__m128i *) src + 0);
+	__m128i xmm1 = _mm_loadu_si128((__m128i *) src + 1);
+	_mm_storeu_si128((__m128i *) dst + 0, xmm0);
+	_mm_storeu_si128((__m128i *) dst + 1, xmm1);
+	n -= sizeof xmm0 + sizeof xmm1;
+	if (n <= 0)
+	    break;
+	src = (__m128i *) src + 2;
+	dst = (__m128i *) dst + 2;
+    }
+}
+#else
+#define copy memcpy
+#endif
+
 // The string tab for %{Name}+%{EVR}, %{RequireVersion} and %{ProvideVersion}.
 char strtab[256<<20];
 int strtabPos = 1; // Any reference is non-zero.
@@ -376,17 +401,42 @@ void dumpSeq(const char *p, const char *end, bool isReq)
 }
 
 // Merge seq1 + seq2 into p.  The output size is bounded by seq1 + seq2.
+// This is a state-of-the-art routine which produces the output without
+// re-encoding the inputs (that is, it tries to reuse common prefixes;
+// furthermore, when possible, it copies input records as is).  The code
+// is not for the feeble-minded; understand it may help you the following
+// THEOREM (Tourbin 2017)
+// If lcp(a, b) = n and lcp(a, c) = m, then
+//  * lcp(b, c) = min(n, m) if n != m;
+//  * lcp(b, c) >= n if n = m.
 char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char *end2, bool isReq, char *p)
 {
-    bool valid1 = false, valid2 = false;
-    char name1[4096], name2[4096], lastName[4096];
-    size_t name1len = 0, name2len = 0, lastNameLen = 0;
+    // Decoded tokens, names[12]len are partial lengths.
     size_t lcp1len = 0, lcp2len = 0;
+    size_t name1len = 0, name2len = 0;
+    // Full decoded names, null-terminated.
+    char name1[4096+16], name2[4096+16], lastName[4096+16];
+    // Additional information from records.
     int ver1 = 0, ver2 = 0;
     int sense1 = 0, sense2 = 0;
     int pkg1 = 0, pkg2 = 0;
-#define decodeDep(N, isReq)				\
+    // Whether a record is already unpacked or needs unpacking.
+    bool valid1 = false, valid2 = false;
+    // When a record is decoded, its sequence gets advanced.  Sometimes,
+    // however, we want to look back to the start of the record.
+    const char *seq1start = NULL, *seq2start = NULL;
+    // Which list was advanced on a previous iteration.  When appending
+    // consecutive records from the same list, the records can be copied
+    // directly from seq[12]start without rebuilding the token.  In the
+    // beginning both seq[12]start can be directly copied to the output.
+    bool last1 = true, last2 = true;
+    // Common prefix between name1 and name2.
+    size_t lcp12len = 0;
+    // Common prefix between name1 and name2 from the previous iteration.
+    size_t lastLcp12len = 0;
+#define decodeDepM(N, isReq)				\
     do {						\
+	seq##N##start = seq##N;				\
 	struct depToken token;				\
 	memcpy(&token, seq##N, 4), seq##N += 4;		\
 	sense##N = token.sense;				\
@@ -395,24 +445,61 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	    memcpy(&ver##N, seq##N, 4), seq##N += 4;	\
 	if (isReq)					\
 	    memcpy(&pkg##N, seq##N, 4), seq##N += 4;	\
-	lcp##N##len = token.lcpLen;			\
-	size_t len = token.len;				\
-	memcpy(name##N + lcp##N##len, seq##N, len);	\
-	seq##N += len;					\
-	name##N##len = lcp##N##len + len;		\
-	name##N[name##N##len] = '\0';			\
+	lcp##N##len = advLcpLen = token.lcpLen;		\
+	name##N##len = token.len;			\
+	copy(name##N + lcp##N##len, seq##N, name##N##len); \
+	name##N[lcp##N##len + name##N##len] = '\0';	\
+	seq##N += name##N##len;				\
+	valid##N = true;				\
     } while (0)
-    while (seq1 < end1 || seq2 < end2 || valid1 || valid2) {
-	if (seq1 < end1 && !valid1) {
-	    valid1 = true;
-	    decodeDep(1, isReq);
+    while (1) {
+	lastLcp12len = lcp12len;
+	// lcpLen of the element which gets advanced.
+	size_t advLcpLen = 0;
+	// Advance as needed.
+	if (!valid1 && seq1 < end1)
+	    decodeDepM(1, isReq);
+	if (!valid2 && seq2 < end2)
+	    decodeDepM(2, isReq);
+	// Comparison name1 <=> name2.
+	int cmp;
+	if (valid1 && valid2) {
+	    // Let advLcpLen=lcp(a,b) be the common prefix between the most
+	    // recently advanced element "b" and the preceding element from
+	    // the same sequence; let lastLcp12len=lcp(a,c) be the common
+	    // prefix between the opposing elements from seq1 and seq2 on
+	    // the previous iteration (during which the element "a" must have
+	    // been output).  By the THEOREM, we can infer the common prefix
+	    // between the currently opposing elements "b" and "c".
+	    if (advLcpLen != lastLcp12len)
+		lcp12len = advLcpLen < lastLcp12len ? advLcpLen : lastLcp12len;
+	    else {
+		lcp12len = lastLcp12len;
+		while (name1[lcp12len] && name1[lcp12len] == name2[lcp12len])
+		    lcp12len++;
+	    }
+	    //assert(lcp12len == lcp(name1, strlen(name1), name2, strlen(name2)));
+	    cmp = (unsigned char) name1[lcp12len] - (unsigned char) name2[lcp12len];
 	}
-	if (seq2 < end2 && !valid2) {
-	    valid2 = true;
-	    decodeDep(2, isReq);
+	else if (valid1) {
+	    // If the previous output was also from seq1, the remaining records
+	    // will be taken care of in one fell swoop at the end of the routine.
+	    // Otherwise, the record will be put after the last seq2 record;
+	    // the records must have been compared on the previous iteration.
+	    // If the record has just the right prefix, it can still be appended.
+	    if (last1 || lastLcp12len == lcp1len)
+		break;
+	    // Otherwise, we simulate "less", so that the record is handled
+	    // in the (cmp < 0) case.
+	    cmp = -1;
 	}
-	int cmp = valid1 && valid2 ? strcmp(name1, name2) :
-		  valid1 ? -1 : 1;
+	else if (valid2) {
+	    if (last2 || lastLcp12len == lcp2len)
+		break;
+	    cmp = +1;
+	}
+	else
+	    break;
 	// If the name is the same, order by having version.
 	if (cmp == 0) {
 	    cmp = (bool) sense1 - (bool) sense2;
@@ -423,39 +510,97 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	    if (cmp == 0 && isReq)
 		cmp = pkg1 - pkg2;
 	}
-	const char *name = NULL;
-	size_t nameLen = 0;
-	int ver = 0;
-	int sense = 0;
-	int pkg = 0;
-	if (cmp <= 0) {
-	    name = name1, nameLen = name1len, ver = ver1, sense = sense1, pkg = pkg1;
-	    valid1 = false;
-	    // Fold identical dependencies, typically Provides
-	    // (e.g. i586-wine Provides: wine = %EVR).
-	    if (cmp == 0)
+	// Fold identical dependencies, typically Provides
+	// (e.g. i586-wine Provides: wine = %EVR).
+	if (cmp == 0) {
+	    if (last1) {
+		// Can copy from seq1 without re-encoding.
+		copy(p, seq1start, seq1 - seq1start), p += seq1 - seq1start;
+		// Update lastName for the next iteration.
+		copy(lastName + lcp1len, name1 + lcp1len, name1len + 1);
+		// Gobbled up.
+		valid1 = false;
+		// Now need to discard the opposing dup.
+		if (seq2 == end2) {
+		    valid2 = false;
+		    continue;
+		}
+		// Pretend as if the dup never existed.
+		decodeDepM(2, isReq);
+		// As if we've been opposing the next element.
+		lcp12len = lcp2len;
+		// Or even as if the dup has been output.
+		last2 = true;
+	    }
+	    else {
+		// When cmp == 0, direct copying is always possible.
+		// This just mirrors the logic for the last2 case.
+		copy(p, seq2start, seq2 - seq2start), p += seq2 - seq2start;
+		copy(lastName + lcp2len, name1 + lcp2len, name2len + 1);
 		valid2 = false;
+		if (seq1 == end1) {
+		    valid1 = false;
+		    continue;
+		}
+		decodeDepM(1, isReq);
+		lcp12len = lcp1len;
+		last1 = true;
+	    }
+	}
+	else if (cmp < 0) {
+	    valid1 = false;
+	    last2 = false;
+	    if (last1 || lastLcp12len == lcp1len) {
+		last1 = true;
+		// Can copy from seq1 without re-encoding.
+		copy(p, seq1start, seq1 - seq1start), p += seq1 - seq1start;
+		copy(lastName + lcp1len, name1 + lcp1len, name1len + 1);
+		continue;
+	    }
+	    last1 = true;
+	    // Last put was the record from seq2, after being compared
+	    // to the current record.
+	    size_t lcpLen = lastLcp12len;
+	    //assert(lcpLen == lcp(name1, strlen(name1), lastName, strlen(lastName)));
+	    // Make a token.
+	    size_t len = lcp1len + name1len - lcpLen;
+	    struct depToken token = { .sense = sense1, .lcpLen = lcpLen, .len = len };
+	    // Put the record.
+	    memcpy(p, &token, 4), p += 4;
+	    if (sense1)
+		memcpy(p, &ver1, 4), p += 4;
+	    if (isReq)
+		memcpy(p, &pkg1, 4), p += 4;
+	    copy(p, name1 + lcpLen, len), p += len;
+	    copy(lastName + lcpLen, name1 + lcpLen, len + 1);
 	}
 	else {
-	    name = name2, nameLen = name2len, ver = ver2, sense = sense2, pkg = pkg2;
 	    valid2 = false;
+	    last1 = false;
+	    if (last2 || lastLcp12len == lcp2len) {
+		last2 = true;
+		copy(p, seq2start, seq2 - seq2start), p += seq2 - seq2start;
+		copy(lastName + lcp2len, name2 + lcp2len, name2len + 1);
+		continue;
+	    }
+	    last2 = true;
+	    size_t lcpLen = lastLcp12len;
+	    //assert(lcpLen == lcp(name2, strlen(name2), lastName, strlen(lastName)));
+	    size_t len = lcp2len + name2len - lcpLen;
+	    struct depToken token = { .sense = sense2, .lcpLen = lcpLen, .len = len };
+	    memcpy(p, &token, 4), p += 4;
+	    if (sense2)
+		memcpy(p, &ver2, 4), p += 4;
+	    if (isReq)
+		memcpy(p, &pkg2, 4), p += 4;
+	    copy(p, name2 + lcpLen, len), p += len;
+	    copy(lastName + lcpLen, name2 + lcpLen, len + 1);
 	}
-	// Make a token.
-	size_t lcpLen = lastNameLen ? lcp(lastName, lastNameLen, name, nameLen) : 0;
-	size_t len1 = nameLen - lcpLen;
-	struct depToken token = { .sense = sense, .lcpLen = lcpLen, .len = len1 };
-	// Put the record.
-	memcpy(p, &token, 4), p += 4;
-	if (sense)
-	    memcpy(p, &ver, 4), p += 4;
-	if (isReq)
-	    memcpy(p, &pkg, 4), p += 4;
-	memcpy(p, name + lcpLen, len1);
-	p += len1;
-	// Copy lastName for the next iteration.
-	memcpy(lastName + lcpLen, name + lcpLen, len1 + 1);
-	lastNameLen = nameLen;
     }
+    if (valid1)
+	copy(p, seq1start, end1 - seq1start), p += end1 - seq1start;
+    else if (valid2)
+	copy(p, seq2start, end2 - seq2start), p += end2 - seq2start;
     return p;
 }
 
@@ -518,6 +663,23 @@ void unmets(const char *seqR, const char *endR, const char *seqP, const char *en
     int verR = 0, verP = 0;
     int senseR = 0, senseP = 0;
     int pkgR = 0, pkgP = 0;
+#define decodeDep(N, isReq)				\
+    do {						\
+	struct depToken token;				\
+	memcpy(&token, seq##N, 4), seq##N += 4;		\
+	sense##N = token.sense;				\
+	ver##N = 0;					\
+	if (sense##N)					\
+	    memcpy(&ver##N, seq##N, 4), seq##N += 4;	\
+	if (isReq)					\
+	    memcpy(&pkg##N, seq##N, 4), seq##N += 4;	\
+	lcp##N##len = token.lcpLen;			\
+	size_t len = token.len;				\
+	memcpy(name##N + lcp##N##len, seq##N, len);	\
+	seq##N += len;					\
+	name##N##len = lcp##N##len + len;		\
+	name##N[name##N##len] = '\0';			\
+    } while (0)
     decodeDep(R, true);
     decodeDep(P, false);
     int cmp = strcmp(nameP, nameR);
