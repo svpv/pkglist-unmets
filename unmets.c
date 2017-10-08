@@ -24,6 +24,12 @@
 #include <string.h>
 #include <assert.h>
 
+#ifdef DEBUG
+#define Assert(x) assert(x)
+#else
+#define Assert(x) ((void) 0)
+#endif
+
 // A fast copying routine which can copy more bytes than requested.
 // Works best with short strings when only one iteration may suffice.
 // With constant n, such as n=4, memcpy should still be used.
@@ -48,6 +54,36 @@ static inline void copy(void *dst, const void *src, ssize_t n)
 #else
 #define copy memcpy
 #endif
+
+// Like memcmp(3) except that it finds the longest common prefix.
+// Can load more bytes than requested.  Further does some clever
+// cheating by clobbering its first const arg to and fro.
+static inline size_t blcp(const char *s1, const char *s2, size_t n)
+{
+    const char *s0 = s1;
+    unsigned char *cp = (unsigned char *) &s1[n];
+    unsigned char c = *cp;
+    *cp = ~(unsigned char) s2[n];
+#ifdef __SSE2__
+    while (1) {
+	__m128i xmm1 = _mm_loadu_si128((__m128i *) s1);
+	__m128i xmm2 = _mm_loadu_si128((__m128i *) s2);
+	__m128i xmm3 = _mm_cmpeq_epi8(xmm1, xmm2);
+	unsigned short mask = _mm_movemask_epi8(xmm3);
+	if (mask != 0xffff) {
+	    s1 += ffs(~mask) - 1;
+	    break;
+	}
+	s1 += 16;
+	s2 += 16;
+    }
+#else
+    while (*s1 == *s2)
+	s1++, s2++;
+#endif
+    *cp = c;
+    return s1 - s0;
+}
 
 // The string tab for %{Name}+%{EVR}, %{RequireVersion} and %{ProvideVersion}.
 char strtab[256<<20];
@@ -414,8 +450,6 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
     // Decoded tokens, names[12]len are partial lengths.
     size_t lcp1len = 0, lcp2len = 0;
     size_t name1len = 0, name2len = 0;
-    // Full decoded names, null-terminated.
-    char name1[4096+16], name2[4096+16], lastName[4096+16];
     // Additional information from records.
     int ver1 = 0, ver2 = 0;
     int sense1 = 0, sense2 = 0;
@@ -447,13 +481,13 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	    memcpy(&pkg##N, seq##N, 4), seq##N += 4;	\
 	lcp##N##len = advLcpLen = token.lcpLen;		\
 	name##N##len = token.len;			\
-	copy(name##N + lcp##N##len, seq##N, name##N##len); \
-	name##N[lcp##N##len + name##N##len] = '\0';	\
 	seq##N += name##N##len;				\
-	valid##N = true;				\
+	valid##N = true, adv##N = true;			\
     } while (0)
     while (1) {
 	lastLcp12len = lcp12len;
+	// Which sequence gets advanced, both only in the beginning.
+	bool adv1 = false, adv2 = false;
 	// lcpLen of the element which gets advanced.
 	size_t advLcpLen = 0;
 	// Advance as needed.
@@ -471,15 +505,53 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	    // the previous iteration (during which the element "a" must have
 	    // been output).  By the THEOREM, we can infer the common prefix
 	    // between the currently opposing elements "b" and "c".
-	    if (advLcpLen != lastLcp12len)
-		lcp12len = advLcpLen < lastLcp12len ? advLcpLen : lastLcp12len;
+	    if (advLcpLen != lastLcp12len) {
+		// Both sequences are advanced only in the beginning,
+		// in which case this branch is not taken, because
+		// advLcpLen = 0 (first elements don't have prefixes).
+		Assert(adv1 ^ adv2);
+		// Because inputs are sorted, we can further deduce the result
+		// of compassion.  If the prefix of "b" gets smaller, this
+		// means that some letters within "b" change and become
+		// lexicographically greater.
+		if (advLcpLen < lastLcp12len)
+		    lcp12len = advLcpLen, cmp = adv1 - adv2;
+		else
+		    lcp12len = lastLcp12len, cmp = adv2 - adv1;
+	    }
 	    else {
 		lcp12len = lastLcp12len;
-		while (name1[lcp12len] && name1[lcp12len] == name2[lcp12len])
-		    lcp12len++;
+		// Intuitively, when merging, we cannot produce shorter
+		// common prefixes out of longer common prefixes.  Therefore,
+		// we believe all the bytes which we need to compare must be
+		// placed immediately in seq1 and seq2.
+		Assert(lcp12len >= lcp1len);
+		Assert(lcp12len >= lcp2len);
+		// Will compare [seq1-l1,seq2), [seq2-l2,seq2).
+		// In seq1, literals start at seq1 - name1len.  Subtracting
+		// lcp1len + name2len will logically position at the beginning
+		// of the string.
+		size_t l1 = lcp1len + name1len - lcp12len;
+		size_t l2 = lcp2len + name2len - lcp12len;
+		if (l2 == 0)
+		    cmp = l1;
+		else if (l1 == 0)
+		    cmp = -1;
+		else {
+		    const char *s1 = seq1 - l1;
+		    const char *s2 = seq2 - l2;
+		    cmp = (unsigned char) *s1 - (unsigned char) *s2;
+		    if (cmp == 0) {
+			size_t maxlen = l1 < l2 ? l1 : l2;
+			size_t len = blcp(s1, s2, maxlen);
+			lcp12len += len;
+			if (len < maxlen)
+			    cmp = (unsigned char) s1[len] - (unsigned char) s2[len];
+			else
+			    cmp = (int) l1 - (int) l2;
+		    }
+		}
 	    }
-	    //assert(lcp12len == lcp(name1, strlen(name1), name2, strlen(name2)));
-	    cmp = (unsigned char) name1[lcp12len] - (unsigned char) name2[lcp12len];
 	}
 	else if (valid1) {
 	    // If the previous output was also from seq1, the remaining records
@@ -516,8 +588,6 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	    if (last1) {
 		// Can copy from seq1 without re-encoding.
 		copy(p, seq1start, seq1 - seq1start), p += seq1 - seq1start;
-		// Update lastName for the next iteration.
-		copy(lastName + lcp1len, name1 + lcp1len, name1len + 1);
 		// Gobbled up.
 		valid1 = false;
 		// Now need to discard the opposing dup.
@@ -536,7 +606,6 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 		// When cmp == 0, direct copying is always possible.
 		// This just mirrors the logic for the last2 case.
 		copy(p, seq2start, seq2 - seq2start), p += seq2 - seq2start;
-		copy(lastName + lcp2len, name1 + lcp2len, name2len + 1);
 		valid2 = false;
 		if (seq1 == end1) {
 		    valid1 = false;
@@ -554,14 +623,12 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 		last1 = true;
 		// Can copy from seq1 without re-encoding.
 		copy(p, seq1start, seq1 - seq1start), p += seq1 - seq1start;
-		copy(lastName + lcp1len, name1 + lcp1len, name1len + 1);
 		continue;
 	    }
 	    last1 = true;
 	    // Last put was the record from seq2, after being compared
 	    // to the current record.
 	    size_t lcpLen = lastLcp12len;
-	    //assert(lcpLen == lcp(name1, strlen(name1), lastName, strlen(lastName)));
 	    // Make a token.
 	    size_t len = lcp1len + name1len - lcpLen;
 	    struct depToken token = { .sense = sense1, .lcpLen = lcpLen, .len = len };
@@ -571,8 +638,10 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 		memcpy(p, &ver1, 4), p += 4;
 	    if (isReq)
 		memcpy(p, &pkg1, 4), p += 4;
-	    copy(p, name1 + lcpLen, len), p += len;
-	    copy(lastName + lcpLen, name1 + lcpLen, len + 1);
+	    if (len) {
+		Assert(lcpLen >= lcp1len);
+		copy(p, seq1 - name1len + (lcpLen - lcp1len), len), p += len;
+	    }
 	}
 	else {
 	    valid2 = false;
@@ -580,12 +649,10 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	    if (last2 || lastLcp12len == lcp2len) {
 		last2 = true;
 		copy(p, seq2start, seq2 - seq2start), p += seq2 - seq2start;
-		copy(lastName + lcp2len, name2 + lcp2len, name2len + 1);
 		continue;
 	    }
 	    last2 = true;
 	    size_t lcpLen = lastLcp12len;
-	    //assert(lcpLen == lcp(name2, strlen(name2), lastName, strlen(lastName)));
 	    size_t len = lcp2len + name2len - lcpLen;
 	    struct depToken token = { .sense = sense2, .lcpLen = lcpLen, .len = len };
 	    memcpy(p, &token, 4), p += 4;
@@ -593,8 +660,10 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 		memcpy(p, &ver2, 4), p += 4;
 	    if (isReq)
 		memcpy(p, &pkg2, 4), p += 4;
-	    copy(p, name2 + lcpLen, len), p += len;
-	    copy(lastName + lcpLen, name2 + lcpLen, len + 1);
+	    if (len) {
+		Assert(lcpLen >= lcp2len);
+		copy(p, seq2 - name2len + (lcpLen - lcp2len), len), p += len;
+	    }
 	}
     }
     if (valid1)
