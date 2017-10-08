@@ -121,6 +121,7 @@ int addVer(const char *ver)
     return vpos;
 }
 
+#define ALT_RPM_API
 #include <rpm/rpmlib.h>
 
 int addPkg(Header h)
@@ -709,6 +710,11 @@ bool satisfy(rpmstrPool *poolp, rpmds *dsRp, int verR, int senseR, int verP, int
 	if (strcmp(strtab + verR, strtab + verP) == 0)
 	    return true;
 
+#ifdef ALT_RPM_API
+    bool ret = rpmRangesOverlap("", strtab + verP, senseP,
+				"", strtab + verR, senseR,
+				_rpmds_nopromote);
+#else
     rpmstrPool pool = *poolp;
     if (!pool)
 	pool = *poolp = rpmstrPoolCreate();
@@ -718,6 +724,7 @@ bool satisfy(rpmstrPool *poolp, rpmds *dsRp, int verR, int senseR, int verP, int
     rpmds dsP = rpmdsSinglePool(pool, RPMTAG_PROVIDENAME, "", strtab + verP, senseP);
     bool ret = rpmdsCompare(dsP, dsR);
     rpmdsFree(dsP);
+#endif
     return ret;
 }
 
