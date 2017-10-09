@@ -402,7 +402,7 @@ char *addFnames(Header h, char *p, char *end)
 void dumpSeq(const char *p, const char *end, bool isReq)
 {
     char name[4096];
-    while (1) {
+    while (p < end) {
 	struct depToken token;
 	assert(p + 4 <= end);
 	memcpy(&token, p, 4), p += 4;
@@ -440,8 +440,6 @@ void dumpSeq(const char *p, const char *end, bool isReq)
 	    putchar(' ');
 	    puts(ver);
 	}
-	if (p == end)
-	    break;
     }
 }
 
@@ -902,38 +900,43 @@ int reqFill, provFill;
 // At some point, the stack will have entries with the following npkg values,
 // from top to bottom: 1 2 4 ... n; pushing one more package will trigger a
 // cascade of merges which will result in a single stack entry with npkg=2n.
+// Update: there are now two separate stacks for Requires and Provides.
 struct stackEnt {
     int npkg;
-    int reqOff, provOff;
+    int off;
 };
 
 // With the stack depth of 30, up to a billion packages can be processed.
 // The real limitation lies within the strtab size and SEQBUFSIZE.
-struct stackEnt stack[30];
-int nstack;
+struct stackEnt reqStack[30], provStack[30];
+int nreqStack, nprovStack;
 
 // Merge the two topmost stack entries.
-void mergeStack(void)
+void mergeReqStack(void)
 {
-#define mergeDep(dep, isReq)							\
+#define mergeStack(dep, isReq)						\
     do {								\
-	int off1 = stack[nstack-1].dep##Off;				\
-	int off2 = stack[nstack-2].dep##Off;				\
+	int off1 = dep##Stack[n##dep##Stack-1].off;			\
+	int off2 = dep##Stack[n##dep##Stack-2].off;			\
 	int fill = mergeSeq(dep##Seq + off1, dep##Seq + dep##Fill,	\
 			    dep##Seq + off2, dep##Seq + off1,		\
 			    isReq, tmpSeq) - tmpSeq;			\
-	if (nstack > 2) /* copy back */					\
+	if (n##dep##Stack > 2) /* copy back */				\
 	    memcpy(dep##Seq + off2, tmpSeq, fill);			\
 	else { /* switch places */					\
 	    char *p = dep##Seq;						\
 	    dep##Seq = tmpSeq, tmpSeq = p;				\
 	}								\
 	dep##Fill = off2 + fill;					\
+	dep##Stack[n##dep##Stack-2].npkg +=				\
+	dep##Stack[n##dep##Stack-1].npkg;				\
+	n##dep##Stack--;						\
     } while (0)
-    mergeDep(req, true);
-    mergeDep(prov, false);
-    stack[nstack-2].npkg += stack[nstack-1].npkg;
-    nstack--;
+    mergeStack(req, true);
+}
+void mergeProvStack(void)
+{
+    mergeStack(prov, false);
 }
 
 // Peek at the first character in a sequence.
@@ -948,6 +951,7 @@ unsigned char seqFirstChar(const char *p, bool isReq)
     return *p;
 }
 
+int build_deps;
 int verbose;
 int npkg;
 
@@ -955,9 +959,26 @@ void addHeader(Header h)
 {
     // Add the package.
     int pkgIx = addPkg(h);
+    if (verbose > 1)
+	fprintf(stderr, "loading %s\n", strtab + pkgIx);
+    npkg++;
+    // If --build-deps is enabled, only BuildRequires should be checked;
+    // in other words, Requires from regular packages should be skipped.
+    bool isSource = headerIsSource(h);
+    if (build_deps && !isSource)
+	goto noreq;
     // Add Requires.
     int reqOff = reqFill;
     reqFill = addReq(h, pkgIx, reqSeq + reqFill, reqSeq + SEQBUFSIZE) - reqSeq;
+    // Push onto the stack.
+    reqStack[nreqStack++] = (struct stackEnt) { .npkg = 1, .off = reqOff };
+    // Run merges.
+    while (nreqStack > 1 && reqStack[nreqStack-1].npkg >= reqStack[nreqStack-2].npkg)
+	mergeReqStack();
+noreq:
+    // Source rpms have neither Provides nor Filenames which could satisfy Requires.
+    if (isSource)
+	return;
     // Add Filenames.
     int prov2off = provFill;
     provFill = addFnames(h, provSeq + provFill, provSeq + SEQBUFSIZE) - provSeq;
@@ -972,15 +993,26 @@ void addHeader(Header h)
 	memcpy(provSeq + prov2off, tmpSeq, fill);
 	provFill = prov2off + fill;
     }
-    // Push onto the stack.
-    stack[nstack++] = (struct stackEnt) { 1, reqOff, prov2off };
-    // Run merges.
-    while (nstack > 1 && stack[nstack-1].npkg >= stack[nstack-2].npkg)
-	mergeStack();
-    // It's done when it's done.
-    if (verbose > 1)
-	fprintf(stderr, "loaded %s\n", strtab + pkgIx);
-    npkg++;
+    provStack[nprovStack++] = (struct stackEnt) { .npkg = 1, .off = prov2off };
+    while (nprovStack > 1 && provStack[nprovStack-1].npkg >= provStack[nprovStack-2].npkg)
+	mergeProvStack();
+}
+
+void addRpmlibProv(void)
+{
+    rpmds ds = NULL;
+    int rc = rpmdsRpmlib(&ds, NULL);
+    assert(rc == 0 && ds);
+    Header h = headerNew();
+    assert(h);
+    rc = rpmdsPutToHeader(ds, h);
+    assert(rc == 0);
+    int provOff = provFill;
+    provFill = addProv(h, provSeq + provFill, provSeq + SEQBUFSIZE) - provSeq;
+    assert(provFill > provOff);
+    provStack[nprovStack++] = (struct stackEnt) { .npkg = 1, .off = provOff };
+    rpmdsFree(ds);
+    headerFree(h);
 }
 
 #include <stdbool.h>
@@ -1002,6 +1034,7 @@ int dump_provides;
 const struct option longopts[] = {
     { "dump-requires", no_argument, &dump_requires, 1 },
     { "dump-provides", no_argument, &dump_provides, 1 },
+    { "build-deps", no_argument, &build_deps, 1 },
     { "help", no_argument, NULL, 'h' },
     { "verbose", no_argument, NULL, 'v' },
     { NULL },
@@ -1036,25 +1069,17 @@ int main(int argc, char **argv)
 	fprintf(stderr, "Usage: cat /var/lib/apt/lists/*pkglist.* | %s\n", argv0);
 	return 1;
     }
+    addRpmlibProv();
     FD_t Fd = fdDup(0);
     Header h;
     while ((h = headerRead(Fd, HEADER_MAGIC_YES))) {
-	if (npkg == 0) {
-	    // Smuggle rpmilb Provides with the frist package.
-	    rpmds ds = NULL;
-	    int rc = rpmdsRpmlib(&ds, NULL);
-	    assert(rc == 0 && ds);
-	    rc = rpmdsPutToHeader(ds, h);
-	    assert(rc == 0);
-	    rpmdsFree(ds);
-	}
 	addHeader(h);
 	headerFree(h);
     }
     Fclose(Fd);
     // Run the final series of merges.
-    while (nstack > 1)
-	mergeStack();
+    while (nreqStack > 1) mergeReqStack();
+    while (nprovStack > 1) mergeProvStack();
 #ifdef DEBUG
     fprintf(stderr, "reqSeq size=%d hash=%08x\n", reqFill, djb(reqSeq, reqSeq + reqFill));
     fprintf(stderr, "provSeq size=%d hash=%08x\n", provFill, djb(provSeq, provSeq + provFill));
@@ -1069,7 +1094,7 @@ int main(int argc, char **argv)
 	dumpSeq(reqSeq, reqSeq + reqFill, true);
     else if (dump_provides)
 	dumpSeq(provSeq, provSeq + provFill, false);
-    else
+    else if (reqFill)
 	unmets(reqSeq, reqSeq + reqFill, provSeq, provSeq + provFill);
     return 0;
 }
