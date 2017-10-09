@@ -903,6 +903,18 @@ void mergeStack(void)
     nstack--;
 }
 
+// Peek at the first character in a sequence.
+unsigned char seqFirstChar(const char *p, bool isReq)
+{
+    struct depToken token;
+    memcpy(&token, p, 4), p += 4;
+    if (token.sense)
+	p += 4;
+    if (isReq)
+	p += 4;
+    return *p;
+}
+
 int verbose;
 int npkg;
 
@@ -913,14 +925,14 @@ void addHeader(Header h)
     // Add Requires.
     int reqOff = reqFill;
     reqFill = addReq(h, pkgIx, reqSeq + reqFill, reqSeq + SEQBUFSIZE) - reqSeq;
-    // Add Provides.
-    int prov2off = provFill;
-    provFill = addProv(h, provSeq + provFill, provSeq + SEQBUFSIZE) - provSeq;
     // Add Filenames.
-    int prov1off = provFill;
+    int prov2off = provFill;
     provFill = addFnames(h, provSeq + provFill, provSeq + SEQBUFSIZE) - provSeq;
-    // Merge Provides+Filenames.
-    if (provFill > prov1off) {
+    // Add Provides.
+    int prov1off = provFill;
+    provFill = addProv(h, provSeq + provFill, provSeq + SEQBUFSIZE) - provSeq;
+    // Merge Provides+Filenames, unless Provides has no paths.
+    if (prov1off > prov2off && seqFirstChar(provSeq + prov1off, false) <= '/') {
 	int fill = mergeSeq(provSeq + prov1off, provSeq + provFill,
 			    provSeq + prov2off, provSeq + prov1off,
 			    false, tmpSeq) - tmpSeq;
