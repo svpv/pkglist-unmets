@@ -706,9 +706,14 @@ bool satisfy(rpmstrPool *poolp, rpmds *dsRp, int verR, int senseR, int verP, int
     assert(senseR);
 
     // Equal version strings => equal versions.
-    if (senseR == RPMSENSE_EQUAL && senseP == RPMSENSE_EQUAL)
+    if (verR == verP) {
+	if (senseR & senseP & RPMSENSE_EQUAL)
+	    return true;
+    }
+    else if (senseR == RPMSENSE_EQUAL && senseP == RPMSENSE_EQUAL) {
 	if (strcmp(strtab + verR, strtab + verP) == 0)
 	    return true;
+    }
 
 #ifdef ALT_RPM_API
     bool ret = rpmRangesOverlap("", strtab + verP, senseP,
