@@ -205,34 +205,34 @@ static_assert((RPMSENSE_LESS | RPMSENSE_GREATER | RPMSENSE_EQUAL) < 16, "sense")
 #include <stdbool.h>
 #include "qsort.h"
 
-static inline int depCmp(size_t i, size_t j, const char **names, const char **versions, int *flags)
+static inline int depCmp(size_t i, size_t j, const char **names, int *versions, int *senses)
 {
     int cmp = strcmp(names[i], names[j]);
     if (cmp) return cmp;
-    bool hasVer1 = flags[i] & RPMSENSE_SENSEMASK;
-    bool hasVer2 = flags[j] & RPMSENSE_SENSEMASK;
     // Deps with version go before the versionless ones.
     // This way, the latter are easier to discard.
-    cmp = hasVer2 - hasVer1;
+    cmp = senses[j] - senses[i];
     if (cmp) return cmp;
     // Neither has a version?
-    if (!hasVer1) return cmp;
-    // Both have versions.  Any ordering would do.
-    return strcmp(versions[i], versions[j]);
+    if (!senses[i]) return cmp;
+    // Both have versions.
+    Assert(senses[i] && senses[j]);
+    // Order by version index in strtab.
+    return versions[i] - versions[j];
 }
 
-static inline void depSwap(size_t i, size_t j, const char **names, const char **versions, int *flags)
+static inline void depSwap(size_t i, size_t j, const char **names, int *versions, int *senses)
 {
-    const char *tmpName, *tmpVersion; int tmpFlags;
-    tmpName =  names[i], tmpVersion  = versions[i], tmpFlags = flags[i];
-    names[i] = names[j], versions[i] = versions[j], flags[i] = flags[j];
-    names[j] = tmpName,  versions[j] = tmpVersion,  flags[j] = tmpFlags;
+    const char *tmpName; int tmpVersion; int tmpSense;
+    tmpName  = names[i], tmpVersion  = versions[i], tmpSense  = senses[i];
+    names[i] = names[j], versions[i] = versions[j], senses[i] = senses[j];
+    names[j] = tmpName,  versions[j] = tmpVersion,  senses[j] = tmpSense;
 }
 
-void sortDeps(int n, const char **names, const char **versions, int *flags)
+void sortDeps(int n, const char **names, int *versions, int *senses)
 {
-#define DEP_LESS(i, j) depCmp(i, j, names, versions, flags) < 0
-#define DEP_SWAP(i, j) depSwap(i, j, names, versions, flags)
+#define DEP_LESS(i, j) depCmp(i, j, names, versions, senses) < 0
+#define DEP_SWAP(i, j) depSwap(i, j, names, versions, senses)
     QSORT(n, DEP_LESS, DEP_SWAP);
 }
 
@@ -261,7 +261,7 @@ char *addDeps(Header h, int pkgIx, char *p, char *end)
     assert(rc == 1);
     assert(td2.count == n);
     assert(td2.type == RPM_STRING_ARRAY_TYPE);
-    const char **versions = td2.data;
+    union { const char **s; int *i; } versions = { td2.data };
 
     rc = headerGet(h, tags[!pkgIx][2], &td3, HEADERGET_MINMEM);
     assert(rc == 1);
@@ -269,37 +269,45 @@ char *addDeps(Header h, int pkgIx, char *p, char *end)
     assert(td3.type == RPM_INT32_TYPE);
     int *flags = td3.data;
 
-    sortDeps(n, names, versions, flags);
+
+    for (int i = 0; i < n; i++) {
+	flags[i] &= RPMSENSE_LESS | RPMSENSE_GREATER | RPMSENSE_EQUAL;
+	versions.i[i] = flags[i] ? addVer(versions.s[i]) : 0;
+    }
+
+    sortDeps(n, names, versions.i, flags);
 
     size_t lastNameLen = 0;
     for (int i = 0; i < n; i++) {
 	// Make a token.
-	unsigned sense = flags[i] & (RPMSENSE_LESS | RPMSENSE_GREATER | RPMSENSE_EQUAL);
+	unsigned sense = flags[i];
 	size_t nameLen = strlen(names[i]);
 	assert(nameLen < 4096);
 	size_t lcpLen = i ? lcp(names[i-1], lastNameLen, names[i], nameLen) : 0;
 	// RequireName not changed?
 	bool sameName = lcpLen == nameLen && nameLen == lastNameLen;
-	if (pkgIx && sameName)
+	if (sameName) {
 	    // No version? It must be a dup then, as per depCmp ordering.
 	    // E.g. "Requires: /bin/sh" and "Requires(pre): /bin/sh".
-	    if (sense == 0)
+	    if (pkgIx && sense == 0)
 		continue;
+	    // The logic is only valid for Requires (hence pkgIx is checked);
+	    // versionless Provides should not be eliminated, because they
+	    // can resolve imzian "python(foo) < 0" dependencies.  Another
+	    // more general rule can handle dups for both Requires and Provides.
+	    if (flags[i-1] == flags[i] && versions.i[i-1] == versions.i[i])
+		continue;
+	}
 	size_t len1 = nameLen - lcpLen;
 	struct depToken token = { .sense = sense, .lcpLen = lcpLen, .len = len1 };
 	// Put the record.
 	assert(p + 4 + (sense ? 4 : 0) + (pkgIx ? 4 : 0) + len1 < end);
 	memcpy(p, &token, 4);
 	p += 4;
-	if (sense) {
-	    int vpos = addVer(versions[i]);
-	    memcpy(p, &vpos, 4);
-	    p += 4;
-	}
-	if (pkgIx) {
-	    memcpy(p, &pkgIx, 4);
-	    p += 4;
-	}
+	if (sense)
+	    memcpy(p, &versions.i[i], 4), p += 4;
+	if (pkgIx)
+	    memcpy(p, &pkgIx, 4), p += 4;
 	memcpy(p, names[i] + lcpLen, len1);
 	p += len1;
 	lastNameLen = nameLen;
@@ -573,15 +581,35 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	}
 	else
 	    break;
-	// If the name is the same, order by having version.
+	// If the name is the same...
 	if (cmp == 0) {
-	    cmp = (bool) sense1 - (bool) sense2;
-	    // If both have versions, order by version.
-	    if (cmp == 0 && sense1)
-		cmp = ver1 - ver2;
-	    // As a last resort, Requires are ordered by pkg.
-	    if (cmp == 0 && isReq)
-		cmp = pkg1 - pkg2;
+	    // Requires and Provides are handled differently.
+	    if (isReq) {
+		// Start with depCmp order.
+		cmp = sense2 - sense1;
+		// However, dependencies without version should go first.
+		// This way it will be much easier to skip them in unmets().
+		// This doesn't contradict depCmp order, because addDeps()
+		// doesn't issue both versioned and unversioned Requires
+		// with the same name.
+		if (sense1 == 0 || sense2 == 0)
+		    cmp = -cmp;
+		// If both have versions, order by version.
+		else if (cmp == 0)
+		    cmp = ver1 - ver2;
+		// As a last resort, Requires are ordered by pkg reference.
+		if (cmp == 0)
+		    cmp = pkg1 - pkg2;
+	    }
+	    else {
+		// The same order as depCmp.  Versioned Provides go first.
+		// They are more likely to satisfy Requires.
+		cmp = sense2 - sense1;
+		if (cmp == 0)
+		    cmp = ver1 - ver2;
+		// No last resort, identical Provides will be folded
+		// into a single record.
+	    }
 	}
 	// Fold identical dependencies, typically Provides
 	// (e.g. i586-wine Provides: wine = %EVR).
