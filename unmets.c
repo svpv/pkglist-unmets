@@ -1015,8 +1015,45 @@ void addRpmlibProv(void)
     headerFree(h);
 }
 
-#include <stdbool.h>
+#include <zpkglist.h>
+#include <unistd.h>
+
+bool processFd(int fd, const char *argv0, const char *fname)
+{
+    const char *err[2];
+    struct zpkglistReader *z;
+    const char *func = "zpkglistFdopen";
+    ssize_t ret = zpkglistFdopen(&z, fd, err);
+    if (ret > 0) {
+	void *blob;
+	func = "zpkglistNextMalloc";
+	while ((ret = zpkglistNextMalloc(z, &blob, NULL, false, err)) > 0) {
+	    Header h = headerImport(blob, ret, HEADERIMPORT_FAST);
+	    if (h == NULL) {
+		free(blob);
+		func = err[0] = "headerImport",
+		err[1] = "import failed";
+		ret = -1;
+		break;
+	    }
+	    addHeader(h);
+	    headerFree(h);
+	}
+	zpkglistFree(z);
+    }
+    close(fd);
+    if (ret < 0) {
+	if (strcmp(func, err[0]) == 0 || strncmp(err[0], "zpkglist", 8) == 0)
+	    fprintf(stderr, "%s: %s: %s: %s\n", argv0, fname, err[0], err[1]);
+	else
+	    fprintf(stderr, "%s: %s: %s: %s: %s\n", argv0, fname, func, err[0], err[1]);
+	return false;
+    }
+    return true;
+}
+
 #include <getopt.h>
+#include <fcntl.h> // O_RDONLY
 
 #ifdef DEBUG
 unsigned djb(const char *p, const char *end)
@@ -1061,41 +1098,69 @@ int main(int argc, char **argv)
 	fprintf(stderr, "%s: --dump-requires and --dump-provides are mutually exclusive\n", argv0);
 	usage = 1;
     }
-    if (argc && !usage) {
-	fprintf(stderr, "%s: too many arguments\n", argv0);
+    else if (argc == 0 && isatty(0)) {
+	fprintf(stderr, "refusing to read binary data from a terminal\n");
 	usage = 1;
     }
     if (usage) {
-	fprintf(stderr, "Usage: cat /var/lib/apt/lists/*pkglist.* | %s\n", argv0);
+	fprintf(stderr, "Usage: %s [PKGLIST...]\n", argv0);
 	return 1;
     }
     addRpmlibProv();
-    FD_t Fd = fdDup(0);
-    Header h;
-    while ((h = headerRead(Fd, HEADER_MAGIC_YES))) {
-	addHeader(h);
-	headerFree(h);
+    // With no args, process stdin.
+    char *assume_argv[] = { "-", NULL };
+    if (argc == 0)
+	argc = 1, argv = assume_argv;
+    int maxReqFill = 0;
+    for (int i = 0; i <= argc; i++) {
+	// Assume the last arg is "--".
+	if (i == argc || strcmp(argv[i], "--") == 0) {
+	    if (!nreqStack)
+		continue;
+	    while (nreqStack > 1) mergeReqStack();
+	    while (nprovStack > 1) mergeProvStack();
+#ifdef DEBUG
+	    fprintf(stderr, "reqSeq size=%d hash=%08x\n",
+		    reqFill, djb(reqSeq, reqSeq + reqFill));
+#endif
+	    if (reqFill > maxReqFill)
+		maxReqFill = reqFill;
+	    if (dump_requires)
+		dumpSeq(reqSeq, reqSeq + reqFill, true);
+	    else if (!dump_provides)
+		unmets(reqSeq, reqSeq + reqFill, provSeq, provSeq + provFill);
+	    // This portion of Requires has been processed.
+	    reqFill = 0, nreqStack = 0;
+	}
+	else {
+	    int fd = 0;
+	    const char *fname = argv[i];
+	    if (strcmp(argv[i], "-") == 0)
+		fname = "<stdin>";
+	    else {
+		fd = open(fname, O_RDONLY);
+		if (fd < 0) {
+		    fprintf(stderr, "%s: %s: open: %m\n", argv0, fname);
+		    return 1;
+		}
+	    }
+	    if (!processFd(fd, argv0, fname))
+		return 1;
+	}
     }
-    Fclose(Fd);
-    // Run the final series of merges.
-    while (nreqStack > 1) mergeReqStack();
     while (nprovStack > 1) mergeProvStack();
 #ifdef DEBUG
-    fprintf(stderr, "reqSeq size=%d hash=%08x\n", reqFill, djb(reqSeq, reqSeq + reqFill));
-    fprintf(stderr, "provSeq size=%d hash=%08x\n", provFill, djb(provSeq, provSeq + provFill));
+    fprintf(stderr, "provSeq size=%d hash=%08x\n",
+	    provFill, djb(provSeq, provSeq + provFill));
 #endif
+    if (dump_provides)
+	dumpSeq(provSeq, provSeq + provFill, false);
     if (verbose)
 	fprintf(stderr, "loaded %d headers (%.1fM strtab, %.1fM req, %.1fM prov)\n",
 			 npkg,
-			(double) strtabPos / (1 << 20),
-			(double) reqFill / (1 << 20),
-			(double) provFill / (1 << 20));
-    if (dump_requires)
-	dumpSeq(reqSeq, reqSeq + reqFill, true);
-    else if (dump_provides)
-	dumpSeq(provSeq, provSeq + provFill, false);
-    else if (reqFill)
-	unmets(reqSeq, reqSeq + reqFill, provSeq, provSeq + provFill);
+			(double) strtabPos  / (1 << 20),
+			(double) maxReqFill / (1 << 20),
+			(double) provFill   / (1 << 20));
     return 0;
 }
 
