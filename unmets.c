@@ -452,6 +452,7 @@ void dumpSeq(const char *p, const char *end, bool isReq)
 // If lcp(a, b) = n and lcp(a, c) = m, then
 //  * lcp(b, c) = min(n, m) if n != m;
 //  * lcp(b, c) >= n if n = m.
+static inline __attribute__((always_inline))
 char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char *end2, bool isReq, char *p)
 {
     // Decoded tokens, names[12]len are partial lengths.
@@ -985,15 +986,13 @@ noreq:
     // Add Provides.
     int prov1off = provFill;
     provFill = addProv(h, provSeq + provFill, provSeq + SEQBUFSIZE) - provSeq;
+    provStack[nprovStack++] = (struct stackEnt) { .npkg = 1, .off = prov2off };
     // Merge Provides+Filenames, unless Provides has no paths.
     if (prov1off > prov2off && seqFirstChar(provSeq + prov1off, false) <= '/') {
-	int fill = mergeSeq(provSeq + prov1off, provSeq + provFill,
-			    provSeq + prov2off, provSeq + prov1off,
-			    false, tmpSeq) - tmpSeq;
-	memcpy(provSeq + prov2off, tmpSeq, fill);
-	provFill = prov2off + fill;
+	provStack[nprovStack++] = (struct stackEnt) { .npkg = 1, .off = prov1off };
+	mergeProvStack();
+	provStack[nprovStack-1].npkg = 1;
     }
-    provStack[nprovStack++] = (struct stackEnt) { .npkg = 1, .off = prov2off };
     while (nprovStack > 1 && provStack[nprovStack-1].npkg >= provStack[nprovStack-2].npkg)
 	mergeProvStack();
 }
