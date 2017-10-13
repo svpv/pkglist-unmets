@@ -37,6 +37,7 @@
 #include <emmintrin.h>
 static inline void copy(void *dst, const void *src, ssize_t n)
 {
+    Assert(n >= 0);
     while (1) {
 	// Using two registers to copy 32 bytes works much faster
 	// than using one register to copy 16 bytes at a time.
@@ -462,21 +463,21 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
     int ver1 = 0, ver2 = 0;
     int sense1 = 0, sense2 = 0;
     int pkg1 = 0, pkg2 = 0;
-    // Whether a record is already unpacked or needs unpacking.
-    bool valid1 = false, valid2 = false;
     // When a record is decoded, its sequence gets advanced.  Sometimes,
     // however, we want to look back to the start of the record.
     const char *seq1start = NULL, *seq2start = NULL;
-    // Which list was advanced on a previous iteration.  When appending
-    // consecutive records from the same list, the records can be copied
-    // directly from seq[12]start without rebuilding the token.  In the
-    // beginning both seq[12]start can be directly copied to the output.
-    bool last1 = true, last2 = true;
+    // When a few consecutive elements come from the same sequence,
+    // they can be grouped and copied at once.
+    const char *copy1start = seq1, *copy2start = seq2;
     // Common prefix between name1 and name2.
     size_t lcp12len = 0;
     // Common prefix between name1 and name2 from the previous iteration.
     size_t lastLcp12len = 0;
-#define decodeDepM(N, isReq)				\
+    // Which sequence gets advanced, both only in the beginning.
+    bool adv1 = true, adv2 = true;
+    // lcpLen of the element which gets advanced.
+    size_t advLcpLen = 0;
+#define decodeDepM(N)					\
     do {						\
 	seq##N##start = seq##N;				\
 	struct depToken token;				\
@@ -490,96 +491,77 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	lcp##N##len = advLcpLen = token.lcpLen;		\
 	name##N##len = token.len;			\
 	seq##N += name##N##len;				\
-	valid##N = true, adv##N = true;			\
     } while (0)
+#define putToken(N, lcpLen)					\
+    do {							\
+	size_t len = lcp##N##len + name##N##len - lcpLen;	\
+	struct depToken token = { sense##N, lcpLen, len };	\
+	memcpy(p, &token, 4), p += 4;				\
+	if (sense##N) memcpy(p, &ver##N, 4), p += 4;		\
+	if (isReq)    memcpy(p, &pkg##N, 4), p += 4;		\
+	Assert(lcpLen >= lcp##N##len);				\
+	copy##N##start = seq##N - name##N##len + (lcpLen - lcp##N##len); \
+    } while (0)
+    decodeDepM(1);
+    decodeDepM(2);
     while (1) {
 	lastLcp12len = lcp12len;
-	// Which sequence gets advanced, both only in the beginning.
-	bool adv1 = false, adv2 = false;
-	// lcpLen of the element which gets advanced.
-	size_t advLcpLen = 0;
-	// Advance as needed.
-	if (!valid1 && seq1 < end1)
-	    decodeDepM(1, isReq);
-	if (!valid2 && seq2 < end2)
-	    decodeDepM(2, isReq);
 	// Comparison name1 <=> name2.
 	int cmp;
-	if (valid1 && valid2) {
-	    // Let advLcpLen=lcp(a,b) be the common prefix between the most
-	    // recently advanced element "b" and the preceding element from
-	    // the same sequence; let lastLcp12len=lcp(a,c) be the common
-	    // prefix between the opposing elements from seq1 and seq2 on
-	    // the previous iteration (during which the element "a" must have
-	    // been output).  By the THEOREM, we can infer the common prefix
-	    // between the currently opposing elements "b" and "c".
-	    if (advLcpLen != lastLcp12len) {
-		// Both sequences are advanced only in the beginning,
-		// in which case this branch is not taken, because
-		// advLcpLen = 0 (first elements don't have prefixes).
-		Assert(adv1 ^ adv2);
-		// Because inputs are sorted, we can further deduce the result
-		// of compassion.  If the prefix of "b" gets smaller, this
-		// means that some letters within "b" change and become
-		// lexicographically greater.
-		if (advLcpLen < lastLcp12len)
-		    lcp12len = advLcpLen, cmp = adv1 - adv2;
-		else
-		    lcp12len = lastLcp12len, cmp = adv2 - adv1;
-	    }
+	// Let advLcpLen=lcp(a,b) be the common prefix between the most
+	// recently advanced element "b" and the preceding element from
+	// the same sequence; let lastLcp12len=lcp(a,c) be the common
+	// prefix between the opposing elements from seq1 and seq2 on
+	// the previous iteration (during which the element "a" must have
+	// been output).  By the THEOREM, we can infer the common prefix
+	// between the currently opposing elements "b" and "c".
+	if (advLcpLen != lastLcp12len) {
+	    // Both sequences are advanced only in the beginning,
+	    // in which case this branch is not taken, because
+	    // advLcpLen = 0 (first elements don't have prefixes).
+	    Assert(adv1 ^ adv2);
+	    // Because inputs are sorted, we can further deduce the result
+	    // of compassion.  If the prefix of "b" gets smaller, this
+	    // means that some letters within "b" change and become
+	    // lexicographically greater.
+	    if (advLcpLen < lastLcp12len)
+		lcp12len = advLcpLen, cmp = adv1 - adv2;
+	    else
+		lcp12len = lastLcp12len, cmp = adv2 - adv1;
+	}
+	else {
+	    lcp12len = lastLcp12len;
+	    // Intuitively, when merging, we cannot produce shorter
+	    // common prefixes out of longer common prefixes.  Therefore,
+	    // we believe all the bytes which we need to compare must be
+	    // placed immediately in seq1 and seq2.
+	    Assert(lcp12len >= lcp1len);
+	    Assert(lcp12len >= lcp2len);
+	    // Will compare [seq1-l1,seq2), [seq2-l2,seq2).
+	    // In seq1, literals start at seq1 - name1len.  Subtracting
+	    // lcp1len + name2len will logically position at the beginning
+	    // of the string.
+	    size_t l1 = lcp1len + name1len - lcp12len;
+	    size_t l2 = lcp2len + name2len - lcp12len;
+	    if (l2 == 0)
+		cmp = l1;
+	    else if (l1 == 0)
+		cmp = -1;
 	    else {
-		lcp12len = lastLcp12len;
-		// Intuitively, when merging, we cannot produce shorter
-		// common prefixes out of longer common prefixes.  Therefore,
-		// we believe all the bytes which we need to compare must be
-		// placed immediately in seq1 and seq2.
-		Assert(lcp12len >= lcp1len);
-		Assert(lcp12len >= lcp2len);
-		// Will compare [seq1-l1,seq2), [seq2-l2,seq2).
-		// In seq1, literals start at seq1 - name1len.  Subtracting
-		// lcp1len + name2len will logically position at the beginning
-		// of the string.
-		size_t l1 = lcp1len + name1len - lcp12len;
-		size_t l2 = lcp2len + name2len - lcp12len;
-		if (l2 == 0)
-		    cmp = l1;
-		else if (l1 == 0)
-		    cmp = -1;
-		else {
-		    const char *s1 = seq1 - l1;
-		    const char *s2 = seq2 - l2;
-		    cmp = (unsigned char) *s1 - (unsigned char) *s2;
-		    if (cmp == 0) {
-			size_t maxlen = l1 < l2 ? l1 : l2;
-			size_t len = blcp(s1, s2, maxlen);
-			lcp12len += len;
-			if (len < maxlen)
-			    cmp = (unsigned char) s1[len] - (unsigned char) s2[len];
-			else
-			    cmp = (int) l1 - (int) l2;
-		    }
+		const char *s1 = seq1 - l1;
+		const char *s2 = seq2 - l2;
+		cmp = (unsigned char) *s1 - (unsigned char) *s2;
+		if (cmp == 0) {
+		    size_t maxlen = l1 < l2 ? l1 : l2;
+		    size_t len = blcp(s1, s2, maxlen);
+		    lcp12len += len;
+		    if (len < maxlen)
+			cmp = (unsigned char) s1[len] - (unsigned char) s2[len];
+		    else
+			cmp = (int) l1 - (int) l2;
 		}
 	    }
 	}
-	else if (valid1) {
-	    // If the previous output was also from seq1, the remaining records
-	    // will be taken care of in one fell swoop at the end of the routine.
-	    // Otherwise, the record will be put after the last seq2 record;
-	    // the records must have been compared on the previous iteration.
-	    // If the record has just the right prefix, it can still be appended.
-	    if (last1 || lastLcp12len == lcp1len)
-		break;
-	    // Otherwise, we simulate "less", so that the record is handled
-	    // in the (cmp < 0) case.
-	    cmp = -1;
-	}
-	else if (valid2) {
-	    if (last2 || lastLcp12len == lcp2len)
-		break;
-	    cmp = +1;
-	}
-	else
-	    break;
 	// If the name is the same...
 	if (cmp == 0) {
 	    // Requires and Provides are handled differently.
@@ -613,92 +595,96 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	// Fold identical dependencies, typically Provides
 	// (e.g. i586-wine Provides: wine = %EVR).
 	if (cmp == 0) {
-	    if (last1) {
-		// Can copy from seq1 without re-encoding.
-		copy(p, seq1start, seq1 - seq1start), p += seq1 - seq1start;
-		// Gobbled up.
-		valid1 = false;
-		// Now need to discard the opposing dup.
+	    if (adv1) {
+		// Break the adv1=adv2=true initial case.
+		adv2 = false;
+		// Need to discard the opposing dup.
 		if (seq2 == end2) {
-		    valid2 = false;
-		    continue;
+		    // It was the last element in seq2.
+		    copy(p, copy1start, end1 - copy1start), p += end1 - copy1start;
+		    return p;
 		}
-		// Pretend as if the dup never existed.
-		decodeDepM(2, isReq);
+		// Pretend the dup never existed.
+		decodeDepM(2);
 		// As if we've been opposing the next element.
 		lcp12len = lcp2len;
-		// Or even as if the dup has been output.
-		last2 = true;
+		copy2start = seq2start;
+		if (seq1 == end1) {
+		    // Issuing the last element from seq1.
+		    copy(p, copy1start, end1 - copy1start), p += end1 - copy1start;
+		    // The remains of seq2 can be appended as is (because the name is the same).
+		    copy(p, copy2start, end2 - copy2start), p += end2 - copy2start;
+		    return p;
+		}
+		// Both elements are advanced for the next iteration.
+		decodeDepM(1);
 	    }
 	    else {
 		// When cmp == 0, direct copying is always possible.
-		// This just mirrors the logic for the last2 case.
-		copy(p, seq2start, seq2 - seq2start), p += seq2 - seq2start;
-		valid2 = false;
+		// This just mirrors the logic for the adv2 case.
+		Assert(adv2);
+		adv1 = false;
 		if (seq1 == end1) {
-		    valid1 = false;
-		    continue;
+		    copy(p, copy2start, end2 - copy2start), p += end2 - copy2start;
+		    return p;
 		}
-		decodeDepM(1, isReq);
+		decodeDepM(1);
 		lcp12len = lcp1len;
-		last1 = true;
+		copy1start = seq1start;
+		if (seq2 == end2) {
+		    copy(p, copy2start, end2 - copy2start), p += end2 - copy2start;
+		    copy(p, copy1start, end1 - copy1start), p += end1 - copy1start;
+		    return p;
+		}
+		decodeDepM(2);
 	    }
 	}
 	else if (cmp < 0) {
-	    valid1 = false;
-	    last2 = false;
-	    if (last1 || lastLcp12len == lcp1len) {
-		last1 = true;
-		// Can copy from seq1 without re-encoding.
-		copy(p, seq1start, seq1 - seq1start), p += seq1 - seq1start;
-		continue;
+	    adv2 = false;
+	    if (!adv1) {
+		adv1 = true;
+		// Switching from seq2 to seq1, flush seq2.
+		copy(p, copy2start, seq2start - copy2start), p += seq2start - copy2start;
+		copy2start = seq2start;
+		// Last put was the record from seq2, after being compared
+		// to the current record from seq1 that we're now issuing.
+		// Therefore, we already know the common prefix between
+		// the output elements.  If the input prefix is different,
+		// the token needs to be reassembled (and putToken will
+		// set the new copy1start).
+		if (lastLcp12len != lcp1len)
+		    putToken(1, lastLcp12len);
 	    }
-	    last1 = true;
-	    // Last put was the record from seq2, after being compared
-	    // to the current record.
-	    size_t lcpLen = lastLcp12len;
-	    // Make a token.
-	    size_t len = lcp1len + name1len - lcpLen;
-	    struct depToken token = { .sense = sense1, .lcpLen = lcpLen, .len = len };
-	    // Put the record.
-	    memcpy(p, &token, 4), p += 4;
-	    if (sense1)
-		memcpy(p, &ver1, 4), p += 4;
-	    if (isReq)
-		memcpy(p, &pkg1, 4), p += 4;
-	    if (len) {
-		Assert(lcpLen >= lcp1len);
-		copy(p, seq1 - name1len + (lcpLen - lcp1len), len), p += len;
+	    if (seq1 == end1) {
+		copy(p, copy1start, end1 - copy1start), p += end1 - copy1start;
+		Assert(seq2start == copy2start);
+		if (lcp12len != lcp2len)
+		    putToken(2, lcp12len);
+		copy(p, copy2start, end2 - copy2start), p += end2 - copy2start;
+		return p;
 	    }
+	    decodeDepM(1);
 	}
 	else {
-	    valid2 = false;
-	    last1 = false;
-	    if (last2 || lastLcp12len == lcp2len) {
-		last2 = true;
-		copy(p, seq2start, seq2 - seq2start), p += seq2 - seq2start;
-		continue;
+	    adv1 = false;
+	    if (!adv2) {
+		adv2 = true;
+		copy(p, copy1start, seq1start - copy1start), p += seq1start - copy1start;
+		copy1start = seq1start;
+		if (lastLcp12len != lcp2len)
+		    putToken(2, lastLcp12len);
 	    }
-	    last2 = true;
-	    size_t lcpLen = lastLcp12len;
-	    size_t len = lcp2len + name2len - lcpLen;
-	    struct depToken token = { .sense = sense2, .lcpLen = lcpLen, .len = len };
-	    memcpy(p, &token, 4), p += 4;
-	    if (sense2)
-		memcpy(p, &ver2, 4), p += 4;
-	    if (isReq)
-		memcpy(p, &pkg2, 4), p += 4;
-	    if (len) {
-		Assert(lcpLen >= lcp2len);
-		copy(p, seq2 - name2len + (lcpLen - lcp2len), len), p += len;
+	    if (seq2 == end2) {
+		copy(p, copy2start, end2 - copy2start), p += end2 - copy2start;
+		Assert(seq1start == copy1start);
+		if (lcp12len != lcp1len)
+		    putToken(1, lcp12len);
+		copy(p, copy1start, end1 - copy1start), p += end1 - copy1start;
+		return p;
 	    }
+	    decodeDepM(2);
 	}
     }
-    if (valid1)
-	copy(p, seq1start, end1 - seq1start), p += end1 - seq1start;
-    else if (valid2)
-	copy(p, seq2start, end2 - seq2start), p += end2 - seq2start;
-    return p;
 }
 
 // Print an unmet dependency.
