@@ -473,8 +473,10 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
     size_t lcp12len = 0;
     // Common prefix between name1 and name2 from the previous iteration.
     size_t lastLcp12len = 0;
-    // Which sequence gets advanced, both only in the beginning.
-    bool adv1 = true, adv2 = true;
+    // Which sequence gets advanced: (adv < 0) if seq1, (adv > 0) if seq2,
+    // both only in the beginning.  Except for this special case, also
+    // indicates which record was issued on the previous iteration.
+    int adv = 0;
     // lcpLen of the element which gets advanced.
     size_t advLcpLen = 0;
 #define decodeDepM(N)					\
@@ -519,15 +521,15 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	    // Both sequences are advanced only in the beginning,
 	    // in which case this branch is not taken, because
 	    // advLcpLen = 0 (first elements don't have prefixes).
-	    Assert(adv1 ^ adv2);
+	    Assert(adv);
 	    // Because inputs are sorted, we can further deduce the result
 	    // of compassion.  If the prefix of "b" gets smaller, this
 	    // means that some letters within "b" change and become
 	    // lexicographically greater.
 	    if (advLcpLen < lastLcp12len)
-		lcp12len = advLcpLen, cmp = adv1 - adv2;
+		lcp12len = advLcpLen, cmp = -adv;
 	    else
-		lcp12len = lastLcp12len, cmp = adv2 - adv1;
+		lcp12len = lastLcp12len, cmp = +adv;
 	}
 	else {
 	    lcp12len = lastLcp12len;
@@ -595,9 +597,9 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	// Fold identical dependencies, typically Provides
 	// (e.g. i586-wine Provides: wine = %EVR).
 	if (cmp == 0) {
-	    if (adv1) {
-		// Break the adv1=adv2=true initial case.
-		adv2 = false;
+	    if (adv <= 0) {
+		// Break the adv=0 initial case.
+		adv = -1;
 		// Need to discard the opposing dup.
 		if (seq2 == end2) {
 		    // It was the last element in seq2.
@@ -621,9 +623,8 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	    }
 	    else {
 		// When cmp == 0, direct copying is always possible.
-		// This just mirrors the logic for the adv2 case.
-		Assert(adv2);
-		adv1 = false;
+		// This just mirrors the logic for the (adv > 0) case.
+		Assert(adv > 0);
 		if (seq1 == end1) {
 		    copy(p, copy2start, end2 - copy2start), p += end2 - copy2start;
 		    return p;
@@ -640,9 +641,7 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	    }
 	}
 	else if (cmp < 0) {
-	    adv2 = false;
-	    if (!adv1) {
-		adv1 = true;
+	    if (adv > 0) {
 		// Switching from seq2 to seq1, flush seq2.
 		copy(p, copy2start, seq2start - copy2start), p += seq2start - copy2start;
 		copy2start = seq2start;
@@ -655,6 +654,7 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 		if (lastLcp12len != lcp1len)
 		    putToken(1, lastLcp12len);
 	    }
+	    adv = -1;
 	    if (seq1 == end1) {
 		copy(p, copy1start, end1 - copy1start), p += end1 - copy1start;
 		Assert(seq2start == copy2start);
@@ -666,14 +666,13 @@ char *mergeSeq(const char *seq1, const char *end1, const char *seq2, const char 
 	    decodeDepM(1);
 	}
 	else {
-	    adv1 = false;
-	    if (!adv2) {
-		adv2 = true;
+	    if (adv < 0) {
 		copy(p, copy1start, seq1start - copy1start), p += seq1start - copy1start;
 		copy1start = seq1start;
 		if (lastLcp12len != lcp2len)
 		    putToken(2, lastLcp12len);
 	    }
+	    adv = +1;
 	    if (seq2 == end2) {
 		copy(p, copy2start, end2 - copy2start), p += end2 - copy2start;
 		Assert(seq1start == copy1start);
