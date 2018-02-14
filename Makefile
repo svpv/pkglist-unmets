@@ -1,7 +1,7 @@
 RPM_OPT_FLAGS ?= -O2 -g -Wall
 all: pkglist-unmets
 pkglist-unmets: unmets.c
-	$(CC) $(RPM_OPT_FLAGS) -fwhole-program -o $@ $< -lrpm{,io} -lzpkglist
+	$(CC) $(RPM_OPT_FLAGS) -DALT_RPM_API -fwhole-program -o $@ $< -lrpm{,io} -lzpkglist
 ALT = /ALT
 PKGLIST = $(ALT)/Sisyphus/x86_64/base/pkglist.classic.xz
 req.list.1: $(PKGLIST)

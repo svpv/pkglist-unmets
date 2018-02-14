@@ -122,7 +122,6 @@ int addVer(const char *ver)
     return vpos;
 }
 
-#define ALT_RPM_API
 #include <rpm/rpmlib.h>
 
 int addPkg(Header h)
