@@ -1,4 +1,4 @@
-// Copyright (c) 2017 Alexey Tourbin
+// Copyright (c) 2017, 2018 Alexey Tourbin
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -20,6 +20,184 @@
 
 // I don't use "static" in this program to indicate file scope.
 // The program is supposed to be compiled with -fwhole-program.
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <assert.h>
+#include <endian.h>
+#include <t1ha.h>
+#include "fpmap.h"
+
+// The first version of this program was written in 2017.  To find unmet
+// dependencies, the program gradually built two sorted sequences, the sequence
+// of Requires and the sequence of Provides, sorted by name.  The names in each
+// sequence were further front-encoded, like in locatedb(5).  This technique
+// both saved some memory and accelerated merge sort (because the strings
+// devoid of their common prefixes could be compared and merged much faster).
+//
+// Then two important developments happened in 2018:
+// 1) Leo Yuiriev published t1ha2, a non-cryptographic 128-bit hash function.
+// It compares favorably to other such functions in terms of both speed and
+// quality, making fingerprinting techniques more reliable and affordable.
+// (To mitigate the risks of using a non-cryptographic function, each hash
+// operation in the code below is seeded with a random number obtained from
+// auxv[AT_RANDOM] at program startup.)
+// 2) At about the same time, I was experimenting with a new breed of
+// probabilistic data structures rooted in the theory of balanced allocation,
+// similar to what's been lately dubbed the "cuckoo filter".  Specifically
+// I manged to produce the "fingerpint map" (fpmap for short), a very efficient
+// auxiliary data structure for building big hash tables.
+//
+// So can an efficient lookup technique outperform efficient merge sort?
+// Yes it can.  The main intuition here is that global lexicographical ordering
+// is both somewhat expensive - O(n log n) - and redundant.  To merge Requires
+// against Provides, only local grouping is strictly necessary.  The extra work
+// can be avoided if we directly map each Requires/Provides name to its group.
+// This will obviously cost only O(n).
+//
+// Suppose we create a new group for the dependency named "coreutils", and
+// the dependency at hand turns out to be Provides.  We want the record to take
+// as few bytes as possible.  Why, there can even be no such Requires, why
+// bother.  Can we get away with just this?
+//
+//	+---+-+-+-+-+-+-+-+-*-+-+-+-+
+//	| F |  ver  |   name hash   |
+//	+---+-+-+-+-+-+-+-+-*-+-+-+-+
+//
+// "F" contains the flags.  Then we need to store a reference to the version,
+// such as in "Provides: coreutils = 8.27", so that versioned Requires can be
+// resolved.  But we don't need to store the whole name, because the name will
+// only be needed to list unmet Requires, and each Requires comes with its
+// name.  Instead, we store a 64-bit hash value.  The fpmap structure stores
+// another 32+16 bits of the very same 128-bit hash, so we use something like
+// 112-bit hash to identify names.  Pretty good actually, for our purposes.
+//
+// But what if the first dependency that we process is Requires?  Then we need
+// to store the name, because we aren't sure if the dependency will be
+// satisfied.  We store it as an immediate variable-length literal value.
+// We also need to store a reference to the package with the dependency.
+//
+//	+---+-+-+-+-+-+-+-+-+-                    -+
+//	| F |  ver  |  pkg  | c o r e u t i l s \0 |
+//	+---+-+-+-+-+-+-+-+-+-                    -+
+//
+// But the corresponding Provides will likely show up next, and if it satisfies
+// the Requires, the record can be converted to Provides: the name will be
+// clobbered with the hash, because the hash is easier to compare.  Still,
+// we can restore the name by recovering just the four missing characters.
+//
+//	+---+-+-+-+-+-+-+-+-*-+-+-+-+             -+
+//	| F |  ver  |   name hash   | u t i l s \0 |
+//	+---+-+-+-+-+-+-+-+-*-+-+-+-+             -+
+//
+// Now, this kind of "inplace merge" works only in simple cases, until we get
+// more than one Requires that cannot be immediately satisfied, or more than
+// one Provides version.  To aggregate a few different dependencies with the
+// same name, we switch to an "external" malloc'd structure, and simply store
+// a pointer to the structure.  But what about the name?  Well, if there's
+// an immediate value, or if it can be restored, that's great.  Otherwise,
+// we've got just enough bytes (4 out of 8 bytes initially taken by the hash)
+// to store a reference to the name.
+//
+//	+---+-+-+-+-*-+-+-+-+-+-+-+-+
+//	| F |      ptr      |nameref|
+//	+---+-+-+-+-*-+-+-+-+-+-+-+-+
+
+// So here's the dependency record.  Looks ominous but it isn't.
+struct dep {
+    uint8_t flags;
+    union {
+	// The Provides record with a hash.
+	struct {
+	    uint32_t ver;
+	    uint64_t hash;
+	} __attribute__((packed)) prov;
+	// Either Requires or external record.
+	struct {
+	    union {
+		struct {
+		    uint32_t ver;
+		    uint32_t pkg;
+		};
+		struct ext *ext;
+	    };
+	    // Immediate name or reference.
+	    union {
+		char name[1];
+		uint32_t nameref;
+	    };
+	} __attribute__((packed));
+    };
+} __attribute__((packed));
+
+// Note that about 85% of dependency names are provided but never required,
+// and the average name length is about 32 characters.  We manage to pack such
+// Provides into just 13 bytes (not including the version, but versions are
+// shared).  I believe this is as good as it can get.
+static_assert(sizeof(struct dep) == 13, "struct dep packing");
+
+// The flags:
+// An external record accessible via ptr.
+#define F_EXT   0x01
+// RPMSENSE dependency flags (such as ">="), unless F_EXT is set.
+#define F_SENSE 0x0f
+// Saw Provides with this name without a version, sticky.
+#define F_PROV0 0x1f
+// Saw Provides with this name with a version, sticky.
+#define F_PROV1 0x2f
+// The record is Provides, the name is identified by its 64-bit hash.
+#define F_NHASH 0x4f
+// The dependency name is identified with an immediate literal value, sticky.
+// Can be clobbered with a hash and then restored.  When neither F_NHASH nor
+// F_NLIT bits are set, the name is identified with a 4-byte reference.
+#define F_NLIT  0x8f
+
+// The global data structure.
+struct {
+    // The seed for fingerprinting.
+    uint64_t seed;
+    // Maps dependencies by name.
+    struct fpmap *nmap;
+    // Version strings are unique.
+    struct fpmap *vmap;
+    // The store.
+    uint8_t *data;
+    // How many bytes allocated.
+    size_t alloc;
+    // Current position for the write pointer.
+    size_t pos;
+} G;
+
+// Add a Provides dependency without a version.
+void addProv0(const char *name, size_t len)
+{
+    uint64_t hi;
+    uint64_t lo = t1ha2_atonce128(&hi, name, len, G.seed);
+    uint32_t pos[10];
+    size_t n = fpmap_find(G.nmap, lo, pos);
+    for (size_t i = 0; i < n; i++) {
+	struct dep *d = (void *)(G.data + pos[i]);
+	// Recheck the name.
+	if (d->flags & F_NHASH) {
+	    if (d->prov.hash != hi)
+		continue;
+	}
+	else if (d->flags & F_NLIT) {
+	    if (memcmp(name, d->name, len + 1))
+		continue;
+	}
+	else {
+	    if (memcmp(name, G.data + d->nameref, len + 1))
+		continue;
+	}
+	// Piece of cake.
+	d->flags |= F_PROV0;
+	return;
+    }
+    // Not found.
+    // TODO: insert.
+}
 
 #include <string.h>
 #include <assert.h>
