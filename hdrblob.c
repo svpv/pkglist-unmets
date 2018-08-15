@@ -51,6 +51,9 @@ static size_t fmtU32(uint32_t v, char out[16])
     return buf + 16 - b;
 }
 
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
 #include <arpa/inet.h>
 #include <rpm/rpmtag.h>
 #include "hdrblob.h"
@@ -60,12 +63,21 @@ static size_t fmtU32(uint32_t v, char out[16])
 static inline const char *getStr(const struct HeaderEntry *e, int tag,
 	const char *data, size_t dl)
 {
+#ifdef __SSE2__
+    __m128i xmm1 = _mm_set_epi32(htonl(1), -1, htonl(RPM_STRING_TYPE), htonl(tag));
+    __m128i xmm2 = _mm_loadu_si128((__m128i *) e);
+    __m128i xmm3 = _mm_cmpeq_epi32(xmm1, xmm2);
+    int mask = _mm_movemask_epi8(xmm3);
+    if (unlikely(mask != 0xf0ff))
+	return NULL;
+#else
     if (unlikely(e->tag != htonl(tag)))
 	return NULL;
     if (unlikely(e->type != htonl(RPM_STRING_TYPE)))
 	return NULL;
     if (unlikely(e->cnt != htonl(1)))
 	return NULL;
+#endif
     size_t off0 = ntohl(e->off);
     size_t off1 = ntohl(e[1].off);
     if (unlikely(off0 >= dl))
