@@ -54,6 +54,7 @@ static size_t fmtU32(uint32_t v, char out[16])
 #ifdef __SSE2__
 #include <emmintrin.h>
 #endif
+#include <assert.h>
 #include <arpa/inet.h>
 #include <rpm/rpmtag.h>
 #include "hdrblob.h"
@@ -109,11 +110,8 @@ static inline bool getU32(const struct HeaderEntry *e, int tag,
     return true;
 }
 
-// Package location relative to the repo, e.g. RPMS.classic or ../SRPMS.hasher.
-// (This is the last tag used by genpkglist.)
-#define CRPMTAG_DIRECTORY         1000010
 // Maps src.rpm to its subpackages, e.g. foo.src.rpm => [foo, libfoo, libfoo-devel].
-// (This is the last tag used by gensrclist.)
+// This is usually the last tag written by gensrclist.
 #define CRPMTAG_BINARY            1000011
 
 size_t hdrblobNEVRA(const struct HeaderBlob *blob, size_t blobSize,
@@ -121,6 +119,7 @@ size_t hdrblobNEVRA(const struct HeaderBlob *blob, size_t blobSize,
 {
     size_t il = ntohl(blob->il);
     size_t dl = ntohl(blob->dl);
+    // Epoch at ee[4] is probed unconditionally, probes beyond that are bounded.
     if (unlikely(il < 5))
 	return -1;
     const struct HeaderEntry *ee = blob->ee;
@@ -152,17 +151,40 @@ size_t hdrblobNEVRA(const struct HeaderBlob *blob, size_t blobSize,
 	e++;
     }
     // Is it a source package?
-    if (ee[il-1].tag == htonl(CRPMTAG_BINARY)) {
+    int lastTag = ee[il-1].tag;
+    if (lastTag == htonl(CRPMTAG_BINARY)) {
 	*A = "src";
 	return ret;
     }
-    if (ee[il-1].tag != htonl(CRPMTAG_DIRECTORY))
-	return -1;
-    // Deal with Arch.
+    // If RPMTAG_SOURCERPM is present, the package is binary,
+    // and RPMTAG_ARCH must also be set.
+    lastTag = ntohl(lastTag);
+    static_assert(RPMTAG_SOURCERPM > RPMTAG_ARCH, "tag order");
+    if (unlikely(lastTag < RPMTAG_SOURCERPM)) {
+	*A = "src";
+	return ret;
+    }
     while (ntohl(e->tag) < RPMTAG_ARCH)
 	e++;
-    *A = getStr(e, RPMTAG_ARCH, data, dl);
-    if (unlikely(!*A))
+    if (ntohl(e->tag) == RPMTAG_ARCH) {
+	const struct HeaderEntry *f = e + 1;
+	while (ntohl(f->tag) < RPMTAG_SOURCERPM)
+	    f++;
+	if (ntohl(f->tag) == RPMTAG_SOURCERPM) {
+	    *A = getStr(e, RPMTAG_ARCH, data, dl);
+	    if (unlikely(!*A))
+		return -1;
+	    return ret;
+	}
+	// No RPMTAG_SOURCERPM, so RPMTAG_ARCH does not count.
+	*A = "src";
+	return ret;
+    }
+    // No RPMTAG_ARCH, so there should be no RPMTAG_SOURCERPM.
+    while (ntohl(e->tag) < RPMTAG_SOURCERPM)
+	e++;
+    if (ntohl(e->tag) == RPMTAG_SOURCERPM)
 	return -1;
+    *A = "src";
     return ret;
 }

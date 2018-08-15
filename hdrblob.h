@@ -20,8 +20,8 @@
 
 // Lightweight accessor functions for rpm headers which come from pkglist files.
 // To get the best performance, I rely on some peculiarities of pkglist headers,
-// such as CRPMTAG entries.  Thus the code won't work in the more general case,
-// and is less suitable for the end-user applications which are required to
+// so the code probably won't work with just any unloaded header.  Still, I'm
+// trying to be liberal in what I accept, so that end-user applications may
 // survive incremental pkglist format changes (such as adding new tags).
 
 #pragma once
