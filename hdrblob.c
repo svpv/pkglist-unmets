@@ -128,9 +128,11 @@ size_t hdrblobNEVRA(const struct HeaderBlob *blob, size_t blobSize,
     *N = getStr(&ee[1], RPMTAG_N, data, dl); if (unlikely(!*N)) return -1;
     *V = getStr(&ee[2], RPMTAG_V, data, dl); if (unlikely(!*V)) return -1;
     *R = getStr(&ee[3], RPMTAG_R, data, dl); if (unlikely(!*R)) return -1;
+#ifdef HDRBLOB_DEBUG // These checks are somewhat expensive.
     // Adjacent NVR, no embedded null bytes.
     if (rawmemchr(*N, '\0') + 1 != *V) return -1;
     if (rawmemchr(*V, '\0') + 1 != *R) return -1;
+#endif
     // Deal with Epoch.
     size_t ret;
     const struct HeaderEntry *e = &ee[4];
